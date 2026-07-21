@@ -1,0 +1,63 @@
+# Build artifacts
+/build*/
+build-linux-*/
+*.obj
+*.pdb
+*.ilk
+*.exe
+*.dll
+*.tlog
+*.log
+*.idb
+*.o
+*.a
+
+# ROM files (copyrighted) — never commit
+*.smc
+*.sfc
+*.rom
+metalwarriors.sfc
+rom.cfg
+
+# Generated recompiler output (keep directory via .gitkeep)
+src/gen/*
+!src/gen/.gitkeep
+
+# Secrets / local env
+.env
+.env.*
+config.ini
+keybinds.ini
+
+# Save files
+saves/
+*.sav
+*.srm
+
+# Boot traces / crash reports
+boot_trace*.txt
+crash_report_*.json
+crash_minidump_*.dmp
+last_run_report.json
+
+# IDE / OS
+.vs/
+*.vcxproj.user
+Thumbs.db
+.DS_Store
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Release / package scratch
+release-linux/
+release-stage/
+release-macos*/
+MetalWarriorsSNESRecomp-*.zip
+MetalWarriorsSNESRecomp-*.AppImage
+*.AppImage
+
+# Local scratch
+_*
+hw_trace.log
