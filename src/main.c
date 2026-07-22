@@ -169,6 +169,7 @@ static RecompLauncherCNetplayLaunch g_launcher_lan_launch;
 static RNetIpv4Address
     g_launcher_local_addresses[LAUNCHER_MAX_LOCAL_ADDRESSES];
 static int g_launcher_local_address_count;
+static char g_launcher_external_ip[RNET_IPV4_ADDRESS_TEXT_MAX];
 
 static const char *LauncherLanLobbyPath(void) {
   return "netplay_lan_lobby.txt";
@@ -344,9 +345,26 @@ static int LauncherNpLocalIp(void *ctx, char *out, size_t out_len) {
 }
 
 static int LauncherNpExternalIp(void *ctx, char *out, size_t out_len) {
+  RNetExternalIpv4Config config;
+  int rc;
   (void)ctx;
-  if (out && out_len) snprintf(out, out_len, "Unavailable");
-  return 0;
+  if (!out || !out_len) return 0;
+  if (!g_launcher_external_ip[0]) {
+    rnet_external_ipv4_config_init(&config);
+    /* This callback currently runs on the launcher render thread. Keep the
+     * STUN wait short; a later recomp-ui API can make discovery asynchronous. */
+    config.timeout_ms = 900;
+    rc = rnet_external_ipv4_discover(&config, g_launcher_external_ip,
+                                     sizeof(g_launcher_external_ip));
+    if (rc != RNET_EXTERNAL_IPV4_OK) {
+      fprintf(stderr, "metalwarriors: external IPv4 discovery failed (%d)\n",
+              rc);
+      snprintf(out, out_len, "Unavailable");
+      return 0;
+    }
+  }
+  snprintf(out, out_len, "%s", g_launcher_external_ip);
+  return out[0] != '\0';
 }
 
 static int LauncherNpCreate(void *ctx, const char *lobby_name,
