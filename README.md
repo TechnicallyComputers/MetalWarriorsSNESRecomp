@@ -74,12 +74,14 @@ Both players must use matching builds and the same verified ROM.
 
 1. Start the game on the host, select the ROM, and open **Netplay**.
 2. Choose **Host Lobby**, leave LAN-only mode enabled, select the host address
-   and port (the default is `7777`), then create the lobby.
-3. On the second machine, open **Netplay** and choose **Join Direct**. Enter the
-   host machine's LAN IP and the same port.
-4. Allow the selected UDP port through the host firewall and choose **Start
-   Lobby** on the host. Host and guest may launch in either order; the game
-   waits at the netplay barrier until the direct peer connects.
+   and port (the default is `7777`), then create the lobby. The room is
+   published to both LAN discovery and the remote lobby service when available.
+3. On the second instance, open **Netplay**, select the `LAN - ...` row (or its
+   remote equivalent), and choose **Join**. Both players remain in the lobby
+   modal and can see its occupied slots.
+4. Allow the selected UDP port through the host firewall. Once the guest is
+   visible, choose **Start Lobby** on the host; only then do both instances
+   launch the game together.
 
 For two instances on one machine, use `127.0.0.1` as the host IP. Metal
 Warriors netplay uses two player slots and locks the shared match configuration
