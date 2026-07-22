@@ -26,7 +26,10 @@ message(STATUS "Metal Warriors lobby game_version: ${SNESRECOMP_BUILD_VERSION} (
 
 set(CMAKE_C_STANDARD 11)
 
-set(SNESRECOMP_ROOT ${CMAKE_SOURCE_DIR}/snesrecomp)
+set(SNESRECOMP_ROOT "${CMAKE_SOURCE_DIR}/snesrecomp" CACHE PATH
+    "Path to the snesrecomp checkout used by this game")
+option(SNESRECOMP_NET_ICE
+    "Enable ICE/libjuice for Metal Warriors internet netplay" OFF)
 include(${SNESRECOMP_ROOT}/runner/runner.cmake)
 
 find_package(SDL2 REQUIRED)
@@ -111,11 +114,11 @@ if(WIN32)
     target_link_libraries(MetalWarriorsSNESRecomp PRIVATE ws2_32 dbghelp)
 endif()
 
-# RmlUi pre-boot launcher (default ON). Skip with -DSNESRECOMP_LAUNCHER=OFF
-# for headless CI, or SkipLauncher=1 / --no-launcher at runtime.
-snesrecomp_enable_launcher(MetalWarriorsSNESRecomp)
+# Shared recomp-ui pre-boot launcher. It owns presentation only; the SNES
+# lobby/netcode implementation is supplied through the callbacks in main.c.
+include(${CMAKE_SOURCE_DIR}/recomp-ui/recomp_ui.cmake)
+recomp_target_launcher_ui(MetalWarriorsSNESRecomp)
 
-# Delay-sync netplay (LAN + ICE via lobby signaling). ICE needs libjuice
-# (FetchContent if not installed). Override: -DSNESRECOMP_NET_ICE=OFF
-set(SNESRECOMP_NET_ICE ON CACHE BOOL "Enable ICE/libjuice for Metal Warriors netplay" FORCE)
+# Delay-sync netplay (LAN by default; opt into ICE with
+# -DSNESRECOMP_NET_ICE=ON when libjuice is available).
 snesrecomp_enable_recomp_net(MetalWarriorsSNESRecomp)
