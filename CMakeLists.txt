@@ -1,6 +1,23 @@
 cmake_minimum_required(VERSION 3.16)
 project(MetalWarriorsSNESRecomp C CXX)
 
+# Release pin for lobby matching (SNESRECOMP_BUILD_VERSION / SNES_GAME_VERSION).
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" _MW_VER_RAW)
+string(STRIP "${_MW_VER_RAW}" MW_RELEASE_VERSION)
+set(SNESRECOMP_BUILD_VERSION "" CACHE STRING
+    "Lobby release pin (empty = Release uses VERSION file, else dev)")
+if(SNESRECOMP_BUILD_VERSION STREQUAL "")
+    get_property(_mw_is_multi GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+    if(_mw_is_multi)
+        set(SNESRECOMP_BUILD_VERSION "$<IF:$<CONFIG:Release>,${MW_RELEASE_VERSION},dev>")
+    elseif(CMAKE_BUILD_TYPE STREQUAL "Release")
+        set(SNESRECOMP_BUILD_VERSION "${MW_RELEASE_VERSION}")
+    else()
+        set(SNESRECOMP_BUILD_VERSION "dev")
+    endif()
+endif()
+message(STATUS "Metal Warriors lobby game_version: ${SNESRECOMP_BUILD_VERSION} (VERSION=${MW_RELEASE_VERSION})")
+
 # Cross-platform (macOS/Linux) build for MetalWarriorsSNESRecomp.
 #
 # Prerequisites: a snesrecomp checkout at ./snesrecomp (symlink/clone of the
@@ -70,6 +87,8 @@ target_compile_definitions(MetalWarriorsSNESRecomp PRIVATE
     SYSTEM_VOLUME_MIXER_AVAILABLE=0   # Win32 WASAPI volume control excluded
     SNESRECOMP_TRACE=${_MW_TRACE}     # TCP debug server: 0 in prod, 1 in debug
     SNESRECOMP_REVERSE_DEBUG=0        # raw WRAM stores; matches non-debug generated C
+    SNESRECOMP_BUILD_VERSION="${SNESRECOMP_BUILD_VERSION}"
+    SNES_GAME_VERSION="${SNESRECOMP_BUILD_VERSION}"
 )
 
 # The recompiled C is machine-generated; quiet its warnings and tolerate the

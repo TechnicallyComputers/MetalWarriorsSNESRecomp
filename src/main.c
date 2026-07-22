@@ -1134,7 +1134,8 @@ session_reboot:
 
   /* Netplay: forced expand 71 (peer lock) + full-frame H2H present (default).
    * Offline: WS hard-off for native dual split + local multiplayer.
-   * Vert-widen / +$78 OAM bias hard-off when !snes_netplay_active() (mw_rtl).
+   * OAM vert-widen defaults ON for netplay (VERT_WIDEN=0 to opt out).
+   * Spawn-Y widen still opt-in (SPAWN_Y_WIDEN=1). Both hard-off offline.
    * Opt out full-frame: SNESRECOMP_MW_H2H_FULL_FRAME=0. */
   if (g_netplay_pending) {
     g_config.widescreen = 71;

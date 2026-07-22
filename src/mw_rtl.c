@@ -77,9 +77,13 @@ enum {
 };
 
 static void mw_latch_nmi_camera(void);
+static void mw_elev_dump(void);
 static unsigned mw_ws_extra_u(void);
+static int mw_h2h_vert_widen_armed(void);
 static unsigned s_tile7f_hits;
 static unsigned s_tile_helper_hits;
+/* $00B1 pillar draw → cam-capture local-only (see s_cam_local_only). */
+static int s_pending_b1_local_only;
 
 /* Read a 16-bit CPU vector from bank $00 (emulation/native vector table). */
 static uint32_t mw_read_vector_pc24(uint16_t vec_addr) {
@@ -513,6 +517,9 @@ static void mw_latch_nmi_camera(void) {
               s_tile_helper_hits);
     }
   }
+
+  /* Elevator / platform attribution — SNESRECOMP_MW_ELEV=1. */
+  mw_elev_dump();
 }
 
 static uint16_t mw_stage_cam_x(void) {
@@ -752,9 +759,17 @@ static void mw_draw_sx_hook(CpuState *cpu, uint32_t pc24) {
   }
 }
 
-/* After JSR $8759 returns ($808721) — $82/$84 are the meta-sprite pointer. */
+/* After JSR $8759 returns ($808721) — $82/$84 are the meta-sprite pointer.
+ * X still holds the object. Tag $00B1 pillars for per-cam present ownership. */
 static void mw_draw_meta_hook(CpuState *cpu, uint32_t pc24) {
   (void)pc24;
+  s_pending_b1_local_only = 0;
+  if (MwIsDualViewport() && mw_h2h_vert_widen_armed()) {
+    const uint16_t obj = (uint16_t)cpu->X;
+    if (obj >= 0x1934u && obj < 0x2000u &&
+        mw_wram16((uint16_t)(obj + 0xAu)) == 0x00B1u)
+      s_pending_b1_local_only = 1;
+  }
   if (!mw_ws_entity_hooks_armed())
     return;
   const int16_t sx = (int16_t)mw_wram16(0x0086);
@@ -767,9 +782,9 @@ static void mw_draw_meta_hook(CpuState *cpu, uint32_t pc24) {
   static unsigned logs;
   if (logs < 20 && getenv("SNESRECOMP_MW_COLS")) {
     logs++;
-    fprintf(stderr, "[mw_draw] meta sx=%d sy=%d ptr=%04X/%04X %s\n", (int)sx,
-            (int)sy, (unsigned)p_lo, (unsigned)p_hi,
-            (p_lo | p_hi) ? "ok" : "NULL-skip");
+    fprintf(stderr, "[mw_draw] meta sx=%d sy=%d ptr=%04X/%04X %s b1=%d\n",
+            (int)sx, (int)sy, (unsigned)p_lo, (unsigned)p_hi,
+            (p_lo | p_hi) ? "ok" : "NULL-skip", s_pending_b1_local_only);
   }
 }
 
@@ -920,6 +935,40 @@ static void mw_obj_onscreen_cmp_hook(CpuState *cpu, uint32_t pc24) {
   }
 }
 
+/* Nearer dual cam for world (x,y). */
+static int mw_dual_nearer_cam(uint16_t wx, uint16_t wy) {
+  const uint16_t c0x = mw_wram16(0x1E16u);
+  const uint16_t c0y = mw_wram16(0x1E18u);
+  const uint16_t c1x = mw_wram16(0x1E1Au);
+  const uint16_t c1y = mw_wram16(0x1E1Cu);
+  const int d0x = (int)wx - (int)c0x;
+  const int d0y = (int)wy - (int)c0y;
+  const int d1x = (int)wx - (int)c1x;
+  const int d1y = (int)wy - (int)c1y;
+  const unsigned a0 =
+      (unsigned)((d0x < 0 ? -d0x : d0x) + (d0y < 0 ? -d0y : d0y));
+  const unsigned a1 =
+      (unsigned)((d1x < 0 ? -d1x : d1x) + (d1y < 0 ? -d1y : d1y));
+  return (a1 < a0) ? 1 : 0;
+}
+
+/* Active $00B1 at world X/Y (bbox regs), or 0. */
+static uint16_t mw_find_b1_obj_at(uint16_t wx, uint16_t wy) {
+  uint16_t idx = mw_wram16(0x1E14u);
+  for (int guard = 0; guard < 64 && idx; guard++) {
+    const uint16_t fl = mw_wram16(idx);
+    const uint16_t next = mw_wram16((uint16_t)(idx + 0x14u));
+    if ((fl & 0x8000u) && mw_wram16((uint16_t)(idx + 0xAu)) == 0x00B1u &&
+        mw_wram16((uint16_t)(idx + 2u)) == wx &&
+        mw_wram16((uint16_t)(idx + 4u)) == wy)
+      return idx;
+    if (next == 0 || next == idx)
+      break;
+    idx = next;
+  }
+  return 0;
+}
+
 /* $809A31 — STA $7F0000,X used by doors/platforms (entry $809A18). */
 static void mw_tile_patch_hook(CpuState *cpu, uint32_t pc24) {
   (void)pc24;
@@ -935,7 +984,62 @@ static void mw_tile_patch_hook(CpuState *cpu, uint32_t pc24) {
   }
 }
 
-static int mw_h2h_vert_widen_armed(void); /* defined with Phase 2b block */
+/*
+ * $82837B dual bbox OR: $00B1 pillars update for either cam and thrash
+ * shared $7F / state. Restrict success to the nearer cam only.
+ *  $838D BCC → success via cam0: suppress if B1 nearer cam1
+ *  $83A6 BCS → fail cam1 Y: force fail if B1 nearer cam0 (block cam1 success)
+ */
+static void mw_b1_bbox_cam0_success_hook(CpuState *cpu, uint32_t pc24) {
+  (void)pc24;
+  if (!MwIsDualViewport() || !mw_h2h_vert_widen_armed())
+    return;
+  /* BCC about to succeed when C=0. */
+  if (cpu->_flag_C)
+    return;
+  const uint16_t wx = (uint16_t)cpu->X;
+  const uint16_t wy = (uint16_t)cpu->Y;
+  if (!mw_find_b1_obj_at(wx, wy))
+    return;
+  if (mw_dual_nearer_cam(wx, wy) == 1)
+    cpu->_flag_C = 1; /* fall into dual check / fail — not cam0-owned */
+}
+
+static void mw_b1_bbox_cam1_y_hook(CpuState *cpu, uint32_t pc24) {
+  (void)pc24;
+  if (!MwIsDualViewport() || !mw_h2h_vert_widen_armed())
+    return;
+  const uint16_t wx = (uint16_t)cpu->X;
+  const uint16_t wy = (uint16_t)cpu->Y;
+  if (!mw_find_b1_obj_at(wx, wy))
+    return;
+  if (mw_dual_nearer_cam(wx, wy) == 0)
+    cpu->_flag_C = 1; /* BCS → fail; cam0 owns this pillar */
+}
+
+static int mw_h2h_spawn_y_widen_armed(void);
+
+/* Extra |obj−cam| radius for vertical lifetime (elevators / tall shafts).
+ * Offline 1P default 192 — native radius + ws_extra alone is too short when
+ * the camera pans the shaft. SNESRECOMP_MW_Y_SLOP=0 disables; =N overrides.
+ * Does not touch OAM/CMP vert-widen (that culled $D5B8 elevators). */
+static unsigned mw_ws_y_lifetime_slop(void) {
+  static int cached = -2; /* -2 unset, -1 off, else pixels */
+  if (cached == -2) {
+    const char *e = getenv("SNESRECOMP_MW_Y_SLOP");
+    if (e && e[0] == '0' && e[1] == '\0')
+      cached = -1;
+    else if (e && e[0] >= '1' && e[0] <= '9')
+      cached = atoi(e);
+    else
+      cached = 192;
+  }
+  if (cached < 0)
+    return 0;
+  if (cached > 512)
+    return 512u;
+  return (unsigned)cached;
+}
 
 /*
  * $8283AC: after computing |obj−(cam+80)|, PLA restores the caller's radius
@@ -949,11 +1053,13 @@ static void mw_dist_limit_sta_hook(CpuState *cpu, uint32_t pc24) {
   (void)pc24;
   if (!mw_ws_entity_hooks_armed())
     return;
-  /* Widescreen X slop + H2H full-frame vertical slop so props stay alive above
-   * and below the recentered view (top −$90 / bottom to #$E0). */
+  /* Widescreen X slop + vertical lifetime slop (1P shafts / opt-in H2H).
+   * Not OAM/CMP vert-widen — that path culled $D5B8 elevators. */
   unsigned extra = mw_ws_extra_u();
-  if (mw_h2h_vert_widen_armed() && MwIsDualViewport())
+  if (mw_h2h_spawn_y_widen_armed() && MwIsDualViewport())
     extra += 160u;
+  else if (!MwIsDualViewport() && mw_can_expand_gameplay())
+    extra += mw_ws_y_lifetime_slop();
   if (extra == 0)
     return;
   const uint32_t wide = (uint32_t)cpu->A + (uint32_t)extra;
@@ -2017,10 +2123,11 @@ static void mw_install_hooks(uint32_t const *pcs, size_t n,
  * capture, wrap the staging index at full so ROM keeps emitting; per-cam
  * buffers already hold completed tiles. SNESRECOMP_MW_H2H_OAM_WRAP=0 disables.
  *
- * Vertical FOV widen (follows full-frame default): ROM-poke dual Y CMP
- * (top #$FF70, bottom #$E0). Active-list #$A8 stays native. Staging uses
- * +$78 for negative sy; capture stores pre-bias screen Y so bottom sprites
- * past +$78 still present. SNESRECOMP_MW_H2H_VERT_WIDEN=0/1 overrides.
+ * Vertical FOV OAM widen (netplay default ON): ROM-poke dual Y CMP (top
+ * #$FF70, bottom #$E0) + active-list #$A8→#$E0. Staging uses +$78 for
+ * negative sy; capture stores pre-bias screen Y so bottom sprites past +$78
+ * still present. Opt out: SNESRECOMP_MW_H2H_VERT_WIDEN=0. Spawn/update Y is
+ * separate (SNESRECOMP_MW_H2H_SPAWN_Y_WIDEN=1, default OFF).
  */
 static int mw_h2h_taller_armed(void) {
   static int v = -1;
@@ -2041,14 +2148,13 @@ bool MwH2hFullFrameLocalArmed(void) {
     if (e && e[0] == '0')
       v = 0;
     else
-      v = 1; /* default on — netplay H2H local FOV / top bar / vert-widen */
+      v = 1; /* default on — netplay H2H local FOV / top bar */
   }
   return v != 0;
 }
 
-/* Vert-widen +$78 OAM bias / Y-CMP ROM patches are for netplay full-frame
- * present (which undoes the bias). Offline local H2H must stay native dual
- * OAM — hard-off whenever netplay is inactive. */
+/* OAM +$78 bias / Y-CMP ROM patches for netplay full-frame present.
+ * Default ON (elevators + full-frame Y). Offline hard-off. Opt out: =0. */
 static int mw_h2h_vert_widen_armed(void) {
   if (!snes_netplay_active())
     return 0;
@@ -2057,12 +2163,205 @@ static int mw_h2h_vert_widen_armed(void) {
     const char *e = getenv("SNESRECOMP_MW_H2H_VERT_WIDEN");
     if (e && e[0] == '0')
       v = 0;
-    else if (e && e[0] == '1')
-      v = 1;
     else
-      v = MwH2hFullFrameLocalArmed() ? 1 : 0;
+      v = 1; /* default on — full-frame object Y + elevator draw */
   }
   return v != 0;
+}
+
+/* Dual spawn/update Y window + $8283AC radius slop. Does NOT touch OAM
+ * bias / drawer CMP (those are VERT_WIDEN). Default OFF — playtest with
+ * full-frame default ON was regressive (wrong object lifetime) and still
+ * failed to spawn $D5B8 elevators. Opt in: SPAWN_Y_WIDEN=1. */
+static int mw_h2h_spawn_y_widen_armed(void) {
+  if (!snes_netplay_active())
+    return 0;
+  static int v = -1;
+  if (v < 0) {
+    const char *e = getenv("SNESRECOMP_MW_H2H_SPAWN_Y_WIDEN");
+    if (e && e[0] == '1')
+      v = 1;
+    else
+      v = 0;
+  }
+  return v != 0;
+}
+
+/* Full-frame present BG1 $7F strip repaint. Default ON (needed for FOV
+ * expand). Opt out: SNESRECOMP_MW_H2H_BG1_REBUILD=0 — playtest: skip was
+ * purely regressive and did not move this stage's misaligned plates. */
+static int mw_h2h_bg1_rebuild_armed(void) {
+  static int v = -1;
+  if (v < 0) {
+    const char *e = getenv("SNESRECOMP_MW_H2H_BG1_REBUILD");
+    if (e && e[0] == '0')
+      v = 0;
+    else
+      v = 1;
+  }
+  return v != 0;
+}
+
+/*
+ * Elevator / platform probe (SNESRECOMP_MW_ELEV=1).
+ *
+ * Walks the live object list at $1E14 and dumps each record plus layer
+ * signals (BG1 $7F tile patches, BG2 ROM-idle, OAM occupancy, dual cams).
+ * Compare offline H2H (elevator present) vs netplay to see whether the
+ * object is missing from the list or only failing present.
+ *
+ * Object layout (from existing COLS walker; Y/type not fully confirmed):
+ *   +$00 flags (bit15 = active)  +$02 world X  +$14 next
+ * Heuristic: +$04 treated as world Y for sx/sy columns (verify offline).
+ */
+static void mw_elev_dump(void) {
+  static int armed = -1;
+  if (armed < 0) {
+    const char *e = getenv("SNESRECOMP_MW_ELEV");
+    armed = (e && e[0] && e[0] != '0') ? 1 : 0;
+    if (armed)
+      fprintf(stderr,
+              "[mw_elev] armed — dump $1E14 objects + BG1/BG2/OAM layer "
+              "signals (~2 Hz in dual H2H). Compare offline vs netplay.\n");
+  }
+  if (!armed)
+    return;
+
+  extern int snes_frame_counter;
+  static int last_f = -1;
+  static unsigned last_tile7f, last_helper;
+  /* ~2 Hz once dual/stage is up; every 30 frames otherwise for boot. */
+  const int period = MwIsDualViewport() ? 30 : 60;
+  if (snes_frame_counter < 120 || (snes_frame_counter % period) != 0)
+    return;
+  if (snes_frame_counter == last_f)
+    return;
+  last_f = snes_frame_counter;
+
+  const uint16_t cam0x = s_nmi_latched ? s_nmi_cam_x : mw_wram16(0x1E16);
+  const uint16_t cam0y = s_nmi_latched ? s_nmi_cam_y : mw_wram16(0x1E18);
+  const uint16_t cam1x = s_nmi_latched ? s_nmi_cam2_x : mw_wram16(0x1E1A);
+  const uint16_t cam1y = s_nmi_latched ? s_nmi_cam2_y : mw_wram16(0x1E1C);
+  const uint16_t src1 = s_nmi_latched ? s_nmi_src_bg1 : mw_wram16(0x1E36);
+  const uint16_t src2 = s_nmi_latched ? s_nmi_src_bg2 : mw_wram16(0x1E38);
+  const unsigned d_tile = s_tile7f_hits - last_tile7f;
+  const unsigned d_help = s_tile_helper_hits - last_helper;
+  last_tile7f = s_tile7f_hits;
+  last_helper = s_tile_helper_hits;
+
+  uint16_t bg2_banks = 0;
+  for (unsigned r = 0; r < (unsigned)kMwBg2RomRows; r++) {
+    if (s_bg2_rom_valid_mask & (uint16_t)(1u << r))
+      bg2_banks |= (uint16_t)(1u << (s_bg2_rom_bank[r] & 15u));
+  }
+
+  unsigned oam_on = 0, oam_mid = 0;
+  for (unsigned s = 0; s < 128u; s++) {
+    const unsigned o = 0x14C4u + s * 4u;
+    const uint8_t y = g_ram[o + 1u];
+    if (y >= 0xE0u)
+      continue;
+    oam_on++;
+    if (y >= 0x40u && y < 0xC0u)
+      oam_mid++;
+  }
+
+  fprintf(stderr,
+          "[mw_elev] f=%d dual=%d net=%d vw=%d syw=%d ff=%d gm=%02X mode=%u "
+          "cam0=%04X/%04X cam1=%04X/%04X src=%04X/%04X "
+          "bg2idle=%d rom_mask=%04X bg2bank_lo=%04X "
+          "hs=%04X/%04X vs=%04X/%04X "
+          "tile7f=%u(+%u) helper=%u(+%u) oam_on/mid=%u/%u "
+          "list=$%04X 1EB2=%04X\n",
+          snes_frame_counter, MwIsDualViewport() ? 1 : 0,
+          snes_netplay_active() ? 1 : 0, mw_h2h_vert_widen_armed() ? 1 : 0,
+          mw_h2h_spawn_y_widen_armed() ? 1 : 0,
+          MwH2hFullFrameLocalArmed() ? 1 : 0, (unsigned)g_ram[0x10],
+          g_ppu ? (unsigned)(g_ppu->bgmode & 7) : 0u, (unsigned)cam0x,
+          (unsigned)cam0y, (unsigned)cam1x, (unsigned)cam1y, (unsigned)src1,
+          (unsigned)src2, s_bg2_rom_idle, (unsigned)s_bg2_rom_valid_mask,
+          (unsigned)bg2_banks,
+          (unsigned)(s_nmi_latched ? s_nmi_wram_h0 : mw_wram16(0x1E2E)),
+          (unsigned)(s_nmi_latched ? s_nmi_wram_h0_p2 : mw_wram16(0x1E32)),
+          (unsigned)(s_nmi_latched ? s_nmi_wram_v0 : mw_wram16(0x1E5E)),
+          (unsigned)(s_nmi_latched ? s_nmi_wram_v0_p2 : mw_wram16(0x1E62)),
+          s_tile7f_hits, d_tile, s_tile_helper_hits, d_help, oam_on, oam_mid,
+          (unsigned)mw_wram16(0x1E14), (unsigned)mw_wram16(0x1EB2));
+
+  uint16_t idx = mw_wram16(0x1E14);
+  unsigned n = 0, n_active = 0;
+  for (int guard = 0; guard < 64 && idx; guard++) {
+    const uint16_t fl = mw_wram16(idx);
+    const uint16_t wx = mw_wram16((uint16_t)(idx + 2u));
+    const uint16_t wy = mw_wram16((uint16_t)(idx + 4u)); /* heuristic */
+    const uint16_t w6 = mw_wram16((uint16_t)(idx + 6u));
+    const uint16_t w8 = mw_wram16((uint16_t)(idx + 8u));
+    const uint16_t wa = mw_wram16((uint16_t)(idx + 0xAu));
+    const uint16_t wc = mw_wram16((uint16_t)(idx + 0xCu));
+    const uint16_t we = mw_wram16((uint16_t)(idx + 0xEu));
+    const uint16_t w10 = mw_wram16((uint16_t)(idx + 0x10u));
+    const uint16_t w12 = mw_wram16((uint16_t)(idx + 0x12u));
+    const uint16_t next = mw_wram16((uint16_t)(idx + 0x14u));
+    const int active = (fl & 0x8000u) != 0;
+    if (active)
+      n_active++;
+
+    const int16_t sx0 = (int16_t)(wx - cam0x);
+    const int16_t sy0 = (int16_t)(wy - cam0y);
+    const int16_t sx1 = (int16_t)(wx - cam1x);
+    const int16_t sy1 = (int16_t)(wy - cam1y);
+
+    /* Flag candidates near either camera's playfield. */
+    const char *tag = "";
+    if (active && sx0 >= -64 && sx0 < 320 && sy0 >= -64 && sy0 < 288)
+      tag = " near0";
+    else if (active && sx1 >= -64 && sx1 < 320 && sy1 >= -64 && sy1 < 288)
+      tag = " near1";
+
+    fprintf(stderr,
+            "[mw_elev] obj[%u] @$%04X fl=%04X%s wx=%04X wy?=%04X "
+            "sx0=%d sy0?=%d sx1=%d sy1?=%d "
+            "+6=%04X +8=%04X +A=%04X +C=%04X +E=%04X +10=%04X +12=%04X "
+            "next=%04X\n",
+            n, (unsigned)idx, (unsigned)fl, active ? " act" : "",
+            (unsigned)wx, (unsigned)wy, (int)sx0, (int)sy0, (int)sx1,
+            (int)sy1, (unsigned)w6, (unsigned)w8, (unsigned)wa, (unsigned)wc,
+            (unsigned)we, (unsigned)w10, (unsigned)w12, (unsigned)next);
+
+    /* Raw 0x20 bytes so type/bank pointers are visible even if offsets shift. */
+    fprintf(stderr, "[mw_elev] obj[%u] raw:", n);
+    for (unsigned b = 0; b < 0x20u; b++)
+      fprintf(stderr, " %02X", (unsigned)g_ram[(uint16_t)(idx + b)]);
+    fprintf(stderr, "%s\n", tag);
+
+    n++;
+    if (next == 0 || next == idx)
+      break;
+    idx = next;
+  }
+  fprintf(stderr, "[mw_elev] list_n=%u active=%u (wy? = +$04 heuristic)\n", n,
+          n_active);
+
+  /* BG2 map row 0 sample — elevators-as-BG2 would show non-void here. */
+  if (g_ppu) {
+    const uint16_t base2 = (uint16_t)PPU_bgTilemapAdr(g_ppu, 1);
+    const uint16_t base1 = (uint16_t)PPU_bgTilemapAdr(g_ppu, 0);
+    fprintf(stderr, "[mw_elev] vram bg1base=%04X bg2base=%04X xsc=%u/%u big=%d/%d "
+                    "row0_bg2:",
+            (unsigned)base1, (unsigned)base2,
+            g_ppu ? (unsigned)(g_ppu->bgXsc[0] & 3) : 0u,
+            g_ppu ? (unsigned)(g_ppu->bgXsc[1] & 3) : 0u,
+            g_ppu ? PPU_bigTiles(g_ppu, 0) : 0,
+            g_ppu ? PPU_bigTiles(g_ppu, 1) : 0);
+    for (int c = 0; c < 16; c++)
+      fprintf(stderr, " %04X",
+              (unsigned)g_ppu->vram[(uint16_t)(base2 + c) & 0x7fffu]);
+    fprintf(stderr, "\n[mw_elev] vram row0_bg1:");
+    for (int c = 0; c < 16; c++)
+      fprintf(stderr, " %04X",
+              (unsigned)g_ppu->vram[(uint16_t)(base1 + c) & 0x7fffu]);
+    fprintf(stderr, "\n");
+  }
 }
 
 /* Staging OAM cam tag: 0=P1 cam path, 1=P2 cam path, 0xFF=unknown. */
@@ -2087,6 +2386,8 @@ static uint8_t s_cam_spr[2][128][4];
 static int16_t s_cam_sx[2][128];
 static int16_t s_cam_sy[2][128];
 static uint8_t s_cam_high[2][32];
+/* 1 = $00B1 pillar/platform — present local cam only (no other-cam reproject). */
+static uint8_t s_cam_local_only[2][128];
 static unsigned s_cam_n[2];
 static int s_cam_capture_frame;
 /* Set in STA $14C5 hooks; consumed at tile/attr commit. */
@@ -2105,11 +2406,13 @@ static void mw_cam_oam_reset(void) {
   memset(s_cam_sx, 0, sizeof(s_cam_sx));
   memset(s_cam_sy, 0, sizeof(s_cam_sy));
   memset(s_cam_high, 0, sizeof(s_cam_high));
+  memset(s_cam_local_only, 0, sizeof(s_cam_local_only));
   s_cam_n[0] = s_cam_n[1] = 0;
   for (int c = 0; c < 2; c++)
     for (int s = 0; s < 128; s++)
       s_cam_spr[c][s][1] = 0xf0u;
   s_cam_capture_frame = 0;
+  s_pending_b1_local_only = 0;
   s_pending_sy_valid = 0;
 }
 
@@ -2147,12 +2450,22 @@ static void mw_vram_restore(void) {
  * camera for both). Key $7F src and VRAM cells to that origin only — do not
  * mw_shadow_world / mw_best_bg1_src (cam≠scroll coarse caused diagonal
  * slide+snap while OAM stayed camera-locked).
+ *
+ * BG1: prefer live/sticky stripe src walked by the half→full Y delta in
+ * pitch rows. Naive $42B3(shifted cam) can land one tile off the DMA'd
+ * dual strip on some stages (moving ledges under the mech).
+ * raw_cam_y = scroll_y before present Y recenter (0 → use scroll only).
  */
 static void mw_present_rebuild_layer_strip(int layer, uint16_t cam_x,
                                           uint16_t cam_y, uint16_t scroll_x,
-                                          uint16_t scroll_y, int n_rows) {
+                                          uint16_t scroll_y, int n_rows,
+                                          uint16_t raw_cam_y) {
   if (!g_ppu || n_rows <= 0)
     return;
+
+  uint16_t pitch = mw_wram16(0x00B6);
+  if (pitch < 32)
+    pitch = 0x0290;
 
   /* Prefer scroll (= cam on the full-frame path) so src cells == PPU sample. */
   uint16_t src_w = mw_map_src_from_42b3(scroll_x, scroll_y);
@@ -2164,12 +2477,21 @@ static void mw_present_rebuild_layer_strip(int layer, uint16_t cam_x,
                             ? (s_nmi_latched ? s_nmi_src_bg1 : mw_wram16(0x1E36))
                             : (s_nmi_latched ? s_nmi_src_bg2 : mw_wram16(0x1E38));
   uint16_t src = src_w ? src_w : (sticky ? sticky : live);
+
+  if (layer == 0 && raw_cam_y != 0) {
+    const uint16_t live_src = sticky ? sticky : live;
+    if (live_src) {
+      const unsigned sh = PPU_bigTiles(g_ppu, 0) ? 4u : 3u;
+      const int tile_px = 1 << (int)sh;
+      const int dy = (int)raw_cam_y - (int)scroll_y; /* usually y_bg */
+      const int d_tiles = dy / tile_px;
+      const int adj = (int)live_src - d_tiles * (int)pitch;
+      if (adj > 0 && adj < 0x10000)
+        src = (uint16_t)adj;
+    }
+  }
   if (!src)
     return;
-
-  uint16_t pitch = mw_wram16(0x00B6);
-  if (pitch < 32)
-    pitch = 0x0290;
 
   const unsigned sh = PPU_bigTiles(g_ppu, layer) ? 4u : 3u;
   const int view_cols = 256 >> (int)sh;
@@ -2223,15 +2545,17 @@ static int mw_present_strip_rows(int layer) {
 static void mw_present_rebuild_local_strips(uint16_t cam_x, uint16_t cam_y,
                                            uint16_t h0, uint16_t v0,
                                            uint16_t h1, uint16_t v1,
-                                           int rebuild_bg2) {
+                                           int rebuild_bg1, int rebuild_bg2,
+                                           uint16_t raw_cam_y) {
   mw_vram_save_reset();
-  mw_present_rebuild_layer_strip(0, cam_x, cam_y, h0, v0,
-                                 mw_present_strip_rows(0));
+  if (rebuild_bg1)
+    mw_present_rebuild_layer_strip(0, cam_x, cam_y, h0, v0,
+                                   mw_present_strip_rows(0), raw_cam_y);
   /* Only rebuild BG2 when the game streams it from $7F. Decorative /
    * idle BG2 keeps native VRAM (map fill was painting over the backdrop). */
   if (rebuild_bg2)
     mw_present_rebuild_layer_strip(1, cam_x, cam_y, h1, v1,
-                                   mw_present_strip_rows(1));
+                                   mw_present_strip_rows(1), 0);
 }
 
 /* Present-only: rewrite narrow BG2's DMA strip from ROM (save/restore).
@@ -2324,9 +2648,9 @@ static int mw_h2h_oam_cull_armed(void) {
   return v;
 }
 
-/* Present-only 1P object-list OAM (solution 2). Default OFF — running
- * $8086B6 via interp_bridge during present blanked the screen / killed audio
- * (mutates g_cpu + WRAM mid-present). Opt in: SNESRECOMP_MW_H2H_OBJ_OAM=1. */
+/* Present-only 1P object-list OAM (solution 2). Default OFF — earlier
+ * incomplete WRAM restore after $8086B6 blanked the screen. Opt in:
+ * SNESRECOMP_MW_H2H_OBJ_OAM=1 (use to A/B cam-capture/reproject bugs). */
 static int mw_h2h_obj_oam_armed(void) {
   static int v = -1;
   if (v < 0) {
@@ -2366,17 +2690,27 @@ static int mw_present_oam_from_objects(uint16_t cam_x, uint16_t cam_y_raw) {
     return 0;
 
   CpuState cpu_bak = g_cpu;
+  /* $8086B6: DP scratch, $136E active-list, $14C4..$18FF staging/dual-aux,
+   * $1934 object pool, $1E00 camera/stripe mirrors. $8B01 also walks $17C4
+   * when DP $78 ≠ 0 — force $78=0 so the dual merge is skipped. */
   uint8_t low_bak[0x200];
-  uint8_t mid_bak[0x200];
+  uint8_t list_bak[0x1C4]; /* $1300..$14C3 incl. active list at $136E */
+  uint8_t stage_bak[0x43C]; /* $14C4..$18FF */
   uint8_t pool_bak[24 * 0x1C];
-  uint8_t stage_bak[0x300];
+  uint8_t mid_bak[0x200];
   memcpy(low_bak, g_ram, sizeof(low_bak));
-  memcpy(mid_bak, &g_ram[0x1E00], sizeof(mid_bak));
-  memcpy(pool_bak, &g_ram[0x1934], sizeof(pool_bak));
+  memcpy(list_bak, &g_ram[0x1300], sizeof(list_bak));
   memcpy(stage_bak, &g_ram[0x14C4], sizeof(stage_bak));
+  memcpy(pool_bak, &g_ram[0x1934], sizeof(pool_bak));
+  memcpy(mid_bak, &g_ram[0x1E00], sizeof(mid_bak));
 
   mw_wram16_write(0x1E16u, cam_x);
   mw_wram16_write(0x1E18u, cam_y_raw);
+  /* Keep dual mirrors coherent if any path peeks P2 cam during the draw. */
+  mw_wram16_write(0x1E1Au, cam_x);
+  mw_wram16_write(0x1E1Cu, cam_y_raw);
+  g_ram[0x78] = 0;
+  g_ram[0x79] = 0;
 
   cpu_push_jsr_return_frame(&g_cpu);
   g_cpu.PB = 0x80;
@@ -2385,9 +2719,10 @@ static int mw_present_oam_from_objects(uint16_t cam_x, uint16_t cam_y_raw) {
     mw_staging_to_ppu_oam();
 
   memcpy(g_ram, low_bak, sizeof(low_bak));
-  memcpy(&g_ram[0x1E00], mid_bak, sizeof(mid_bak));
-  memcpy(&g_ram[0x1934], pool_bak, sizeof(pool_bak));
+  memcpy(&g_ram[0x1300], list_bak, sizeof(list_bak));
   memcpy(&g_ram[0x14C4], stage_bak, sizeof(stage_bak));
+  memcpy(&g_ram[0x1934], pool_bak, sizeof(pool_bak));
+  memcpy(&g_ram[0x1E00], mid_bak, sizeof(mid_bak));
   g_cpu = cpu_bak;
 
   if (ok) {
@@ -2488,6 +2823,7 @@ static void mw_cam_oam_commit(unsigned src_off, uint16_t tile_attr) {
   s_cam_spr[cam][dst][3] = (uint8_t)(tile_attr >> 8);
   s_cam_sx[cam][dst] = (int16_t)sx;
   s_cam_sy[cam][dst] = sy;
+  s_cam_local_only[cam][dst] = s_pending_b1_local_only ? 1u : 0u;
   s_cam_capture_frame = 1;
 
   const uint8_t src_h = (uint8_t)((g_ram[src_byte] >> src_sh) & 3u);
@@ -2527,17 +2863,245 @@ static int mw_oam_x9_from_screen(int sx, int extra) {
   return sx;
 }
 
-static int mw_present_oam_dup(const int *xs, const int *ys, const uint8_t *tiles,
-                              unsigned n, int x, int y, uint8_t tile) {
+static int mw_present_oam_dup_tol(const int *xs, const int *ys,
+                                  const uint8_t *tiles, unsigned n, int x,
+                                  int y, uint8_t tile, int tol) {
   for (unsigned i = 0; i < n; i++) {
     if (tiles[i] != tile)
       continue;
     const int dx = xs[i] - x;
     const int dy = ys[i] - y;
-    if (dx <= 6 && dx >= -6 && dy <= 6 && dy >= -6)
+    if (dx <= tol && dx >= -tol && dy <= tol && dy >= -tol)
       return 1;
   }
   return 0;
+}
+
+static int mw_present_oam_dup(const int *xs, const int *ys, const uint8_t *tiles,
+                              unsigned n, int x, int y, uint8_t tile) {
+  return mw_present_oam_dup_tol(xs, ys, tiles, n, x, y, tile, 6);
+}
+
+/* End-match results OAM: OBJ prio 3 (dumps show a34/a35). Gameplay uses
+ * prio 0–2 (a20/a22/a2C/…). Do NOT use mutual screen-XY — results split
+ * across cam0/cam1 at different positions (mutual=0). */
+static int mw_oam_is_results_ui(uint8_t attr) {
+  return (attr & 0x30u) == 0x30u;
+}
+
+static int mw_present_oam_place(int x, int ny, const uint8_t *sp,
+                                uint8_t size_bit, int extra,
+                                uint8_t *right_hints, int *kept_x, int *kept_y,
+                                uint8_t *kept_tile, unsigned *kept, int tol) {
+  if (!g_ppu || !sp || !kept || *kept >= 128u)
+    return 0;
+  if (ny < 0 || ny >= 224)
+    return 0;
+  if (mw_present_oam_dup_tol(kept_x, kept_y, kept_tile, *kept, x, ny, sp[2],
+                             tol))
+    return 0;
+  const int lx9 = mw_oam_x9_from_screen(x, extra);
+  const unsigned dst = *kept;
+  const int idx = (int)dst * 2;
+  g_ppu->oam[idx] =
+      (uint16_t)(lx9 & 0xff) | ((uint16_t)(uint8_t)ny << 8);
+  g_ppu->oam[idx + 1] = (uint16_t)sp[2] | ((uint16_t)sp[3] << 8);
+  const uint8_t hbits =
+      (uint8_t)((size_bit & 2u) | (uint8_t)((lx9 >> 8) & 1));
+  const unsigned dst_byte = dst >> 2;
+  const unsigned dst_sh = (dst & 3u) * 2u;
+  g_ppu->highOam[dst_byte] = (uint8_t)(
+      (g_ppu->highOam[dst_byte] & ~(uint8_t)(3u << dst_sh)) |
+      (uint8_t)(hbits << dst_sh));
+  if (x >= 256 && x < 256 + extra)
+    right_hints[dst >> 3] |= (uint8_t)(1u << (dst & 7u));
+  kept_x[dst] = x;
+  kept_y[dst] = ny;
+  kept_tile[dst] = sp[2];
+  (*kept)++;
+  return 1;
+}
+
+/* Match tile in cam buffer at (sx,sy) within tol. Returns 1 if found. */
+static int mw_cam_find_xy(int cam, int sx, int sy, uint8_t tile, int tol) {
+  if (cam != 0 && cam != 1)
+    return 0;
+  for (unsigned i = 0; i < s_cam_n[cam]; i++) {
+    if (s_cam_spr[cam][i][2] != tile)
+      continue;
+    const int dx = (int)s_cam_sx[cam][i] - sx;
+    const int dy = (int)s_cam_sy[cam][i] - sy;
+    if (dx <= tol && dx >= -tol && dy <= tol && dy >= -tol)
+      return 1;
+  }
+  return 0;
+}
+
+/*
+ * End-match / screen-fixed UI probe (SNESRECOMP_MW_RESULTS=1).
+ * Present-only — no behavior change. Dumps cam-capture layout so we can see
+ * whether results OAM is mutual raw-XY, one-cam-only, or only matches after
+ * cam-delta reproject (world-like). Run through an end-of-match screen and
+ * compare lines tagged [mw_results].
+ */
+static void mw_results_dump(int local_slot, int y_shift, uint16_t loc_x,
+                            uint16_t loc_y, uint16_t oth_x, uint16_t oth_y) {
+  static int armed = -1;
+  if (armed < 0) {
+    const char *e = getenv("SNESRECOMP_MW_RESULTS");
+    armed = (e && e[0] && e[0] != '0') ? 1 : 0;
+    if (armed)
+      fprintf(stderr,
+              "[mw_results] armed — cam-capture UI probe (~2 Hz). Look for "
+              "mutual_raw vs match_reproj vs one-cam-only on end-match.\n");
+  }
+  if (!armed)
+    return;
+
+  extern int snes_frame_counter;
+  static int last_f = -1;
+  if (!MwIsDualViewport())
+    return;
+  if ((snes_frame_counter % 30) != 0 || snes_frame_counter == last_f)
+    return;
+  last_f = snes_frame_counter;
+
+  const int other = local_slot ^ 1;
+  unsigned mutual0 = 0, mutual6 = 0, match_reproj = 0, ui_n = 0;
+  int b0x0 = 512, b0x1 = -512, b0y0 = 512, b0y1 = -512;
+  int b1x0 = 512, b1x1 = -512, b1y0 = 512, b1y1 = -512;
+  long sum0x = 0, sum0y = 0, sum1x = 0, sum1y = 0;
+
+  for (unsigned i = 0; i < s_cam_n[0]; i++) {
+    const int sx = (int)s_cam_sx[0][i];
+    const int sy = (int)s_cam_sy[0][i];
+    const uint8_t tile = s_cam_spr[0][i][2];
+    if (mw_oam_is_results_ui(s_cam_spr[0][i][3]))
+      ui_n++;
+    sum0x += sx;
+    sum0y += sy;
+    if (sx < b0x0)
+      b0x0 = sx;
+    if (sx > b0x1)
+      b0x1 = sx;
+    if (sy < b0y0)
+      b0y0 = sy;
+    if (sy > b0y1)
+      b0y1 = sy;
+    if (mw_cam_find_xy(1, sx, sy, tile, 0))
+      mutual0++;
+    if (mw_cam_find_xy(1, sx, sy, tile, 6))
+      mutual6++;
+  }
+  for (unsigned i = 0; i < s_cam_n[1]; i++) {
+    const int sx = (int)s_cam_sx[1][i];
+    const int sy = (int)s_cam_sy[1][i];
+    if (mw_oam_is_results_ui(s_cam_spr[1][i][3]))
+      ui_n++;
+    sum1x += sx;
+    sum1y += sy;
+    if (sx < b1x0)
+      b1x0 = sx;
+    if (sx > b1x1)
+      b1x1 = sx;
+    if (sy < b1y0)
+      b1y0 = sy;
+    if (sy > b1y1)
+      b1y1 = sy;
+  }
+  /* Reproject test: other → local. Count tiles that match a local sprite
+   * only after cam delta (not at raw XY). */
+  for (unsigned i = 0; i < s_cam_n[other]; i++) {
+    const int ox = (int)s_cam_sx[other][i];
+    const int oy = (int)s_cam_sy[other][i];
+    const uint8_t tile = s_cam_spr[other][i][2];
+    if (mw_cam_find_xy(local_slot, ox, oy, tile, 6))
+      continue; /* raw match — screen-fixed / dual half */
+    const int32_t world_x = (int32_t)oth_x + ox;
+    const int32_t world_y = (int32_t)oth_y + oy;
+    const int rx = (int)(world_x - (int32_t)loc_x);
+    const int ry = (int)(world_y - (int32_t)loc_y);
+    if (mw_cam_find_xy(local_slot, rx, ry, tile, 6))
+      match_reproj++;
+  }
+
+  const int med0x =
+      s_cam_n[0] ? (int)(sum0x / (long)s_cam_n[0]) : 0;
+  const int med0y =
+      s_cam_n[0] ? (int)(sum0y / (long)s_cam_n[0]) : 0;
+  const int med1x =
+      s_cam_n[1] ? (int)(sum1x / (long)s_cam_n[1]) : 0;
+  const int med1y =
+      s_cam_n[1] ? (int)(sum1y / (long)s_cam_n[1]) : 0;
+
+  /* Top tile IDs in local buffer (crude histogram). */
+  unsigned hist[256];
+  memset(hist, 0, sizeof(hist));
+  for (unsigned i = 0; i < s_cam_n[local_slot]; i++)
+    hist[s_cam_spr[local_slot][i][2]]++;
+  uint8_t top_t[5];
+  unsigned top_c[5];
+  memset(top_t, 0, sizeof(top_t));
+  memset(top_c, 0, sizeof(top_c));
+  for (unsigned t = 0; t < 256u; t++) {
+    const unsigned c = hist[t];
+    if (c == 0)
+      continue;
+    for (int k = 0; k < 5; k++) {
+      if (c > top_c[k]) {
+        for (int m = 4; m > k; m--) {
+          top_c[m] = top_c[m - 1];
+          top_t[m] = top_t[m - 1];
+        }
+        top_c[k] = c;
+        top_t[k] = (uint8_t)t;
+        break;
+      }
+    }
+  }
+
+  /* Live PPU OAM still on-screen (pre-present wipe happens after this call). */
+  unsigned live_oam = 0;
+  if (g_ppu) {
+    for (int s = 0; s < 128; s++) {
+      const uint8_t y = (uint8_t)(g_ppu->oam[s * 2] >> 8);
+      if (y < 0xf0u)
+        live_oam++;
+    }
+  }
+
+  fprintf(stderr,
+          "[mw_results] f=%d slot=%d gm=%02X ysh=%d n0=%u n1=%u "
+          "mutual0=%u mutual6=%u match_reproj=%u ui_prio3=%u live_oam=%u\n",
+          snes_frame_counter, local_slot, (unsigned)g_ram[0x10], y_shift,
+          s_cam_n[0], s_cam_n[1], mutual0, mutual6, match_reproj, ui_n,
+          live_oam);
+  fprintf(stderr,
+          "[mw_results] cam0 bbox=(%d..%d,%d..%d) mean=(%d,%d)  "
+          "cam1 bbox=(%d..%d,%d..%d) mean=(%d,%d)  "
+          "dcam=(%d,%d)\n",
+          s_cam_n[0] ? b0x0 : 0, s_cam_n[0] ? b0x1 : 0,
+          s_cam_n[0] ? b0y0 : 0, s_cam_n[0] ? b0y1 : 0, med0x, med0y,
+          s_cam_n[1] ? b1x0 : 0, s_cam_n[1] ? b1x1 : 0,
+          s_cam_n[1] ? b1y0 : 0, s_cam_n[1] ? b1y1 : 0, med1x, med1y,
+          (int)loc_x - (int)oth_x, (int)loc_y - (int)oth_y);
+  fprintf(stderr,
+          "[mw_results] slot%d top tiles: %02X×%u %02X×%u %02X×%u %02X×%u "
+          "%02X×%u\n",
+          local_slot, top_t[0], top_c[0], top_t[1], top_c[1], top_t[2],
+          top_c[2], top_t[3], top_c[3], top_t[4], top_c[4]);
+
+  /* Sample up to 8 sprites from each cam (sx,sy,tile,attr). */
+  for (int cam = 0; cam < 2; cam++) {
+    const unsigned n = s_cam_n[cam] < 8u ? s_cam_n[cam] : 8u;
+    fprintf(stderr, "[mw_results] cam%d sample:", cam);
+    for (unsigned i = 0; i < n; i++) {
+      fprintf(stderr, " (%d,%d t%02X a%02X)", (int)s_cam_sx[cam][i],
+              (int)s_cam_sy[cam][i], s_cam_spr[cam][i][2],
+              s_cam_spr[cam][i][3]);
+    }
+    fprintf(stderr, "%s\n", s_cam_n[cam] > 8u ? " …" : "");
+  }
 }
 
 /*
@@ -2548,6 +3112,12 @@ static int mw_present_oam_dup(const int *xs, const int *ys, const uint8_t *tiles
  * drops the second half for small props (crates), so items near P2 only
  * land in cam0. Naive merge (no reproject) tore mechs; this transforms
  * X/Y by dual cam deltas and dedups against already-placed tiles.
+ *
+ * End-match results (OBJ prio 3 / a34·a35): dual draw splits wins vs menu
+ * across cam0/cam1 (mutual raw=0; both clusters center-stacked so X-span
+ * split mis-groups glyphs). Stamp each cam's UI as a group: wins-like
+ * tile IDs (else lower mean-X) → top, menu → bottom. Never cam-delta
+ * reproject those tiles.
  * Returns 1 if applied (Y already final — caller must NOT apply oam_delta).
  */
 static int mw_present_oam_from_cam_capture(int local_slot, int extra,
@@ -2576,6 +3146,8 @@ static int mw_present_oam_from_cam_capture(int local_slot, int extra,
       other == 0 ? (s_nmi_latched ? s_nmi_cam_y : mw_wram16(0x1E18u))
                  : (s_nmi_latched ? s_nmi_cam2_y : mw_wram16(0x1E1Cu));
 
+  mw_results_dump(local_slot, y_shift, loc_x, loc_y, oth_x, oth_y);
+
   for (int slot = 0; slot < 128; slot++) {
     const int idx = slot * 2;
     g_ppu->oam[idx] = 0x00f0u; /* X=0 Y=$F0 */
@@ -2590,49 +3162,170 @@ static int mw_present_oam_from_cam_capture(int local_slot, int extra,
   uint8_t kept_tile[128];
   unsigned kept = 0;
 
-  /* ---- local buffer (native cam-relative; use captured signed sx) ---- */
+  unsigned ui_n = 0;
+  for (int cam = 0; cam < 2; cam++) {
+    for (unsigned i = 0; i < s_cam_n[cam]; i++) {
+      if (mw_oam_is_results_ui(s_cam_spr[cam][i][3]))
+        ui_n++;
+    }
+  }
+  /* Enough prio-3 glyphs → results overlay (gameplay stays prio≤2). */
+  const int results_ui = (ui_n >= 8u);
+
+  /*
+   * ---- owned results overlay FIRST ----
+   * Dual drawers put wins/W·L on one cam buffer and the menu on the other;
+   * under full-frame both land mid-screen with overlapping X (so a glyph
+   * X-split tears strings). Group by source cam; native L/R → mean-X order
+   * picks top (wins) vs bottom (menu). Raw captured XY only (no y_shift).
+   */
+  if (results_ui) {
+    int cx0[2] = {512, 512}, cx1[2] = {-512, -512};
+    int cy0[2] = {512, 512}, cy1[2] = {-512, -512};
+    int64_t xsum[2] = {0, 0};
+    unsigned cn[2] = {0, 0};
+    /* Dumps: wins/W·L glyphs ~t40–t5F; menu options ~t60–t9F. */
+    int wins_score[2] = {0, 0}, menu_score[2] = {0, 0};
+    for (int cam = 0; cam < 2; cam++) {
+      for (unsigned i = 0; i < s_cam_n[cam]; i++) {
+        if (!mw_oam_is_results_ui(s_cam_spr[cam][i][3]))
+          continue;
+        const int x = (int)s_cam_sx[cam][i];
+        const int y = (int)s_cam_sy[cam][i];
+        if (x + 64 < x_lo || x > x_hi)
+          continue;
+        if (x < cx0[cam])
+          cx0[cam] = x;
+        if (x > cx1[cam])
+          cx1[cam] = x;
+        if (y < cy0[cam])
+          cy0[cam] = y;
+        if (y > cy1[cam])
+          cy1[cam] = y;
+        xsum[cam] += x;
+        cn[cam]++;
+        {
+          const uint8_t t = s_cam_spr[cam][i][2];
+          if (t >= 0x40u && t < 0x60u)
+            wins_score[cam]++;
+          else if (t >= 0x60u && t < 0xA0u)
+            menu_score[cam]++;
+        }
+      }
+    }
+
+    /*
+     * Prefer tile-ID scores (stable under center-stack); fall back to
+     * mean-X (native L/R) when scores are tied.
+     */
+    int cam_top = -1, cam_bot = -1;
+    if (cn[0] > 0 && cn[1] > 0) {
+      const int s0 = wins_score[0] - menu_score[0];
+      const int s1 = wins_score[1] - menu_score[1];
+      if (s0 != s1) {
+        cam_top = (s0 > s1) ? 0 : 1;
+        cam_bot = cam_top ^ 1;
+      } else {
+        const int mean0 = (int)(xsum[0] / (int64_t)cn[0]);
+        const int mean1 = (int)(xsum[1] / (int64_t)cn[1]);
+        cam_top = (mean0 <= mean1) ? 0 : 1;
+        cam_bot = cam_top ^ 1;
+      }
+      /* Playtest: bands were inverted (menu top / wins bottom) — swap. */
+      {
+        const int t = cam_top;
+        cam_top = cam_bot;
+        cam_bot = t;
+      }
+    } else if (cn[0] > 0) {
+      cam_top = 0;
+    } else if (cn[1] > 0) {
+      cam_top = 1;
+    }
+
+    const int content_w = 256;
+    int dx[2] = {0, 0}, dy[2] = {0, 0};
+    if (cam_top >= 0) {
+      const int c = cam_top;
+      const int gw = cx1[c] - cx0[c];
+      const int tx = (content_w - gw) / 2;
+      /* Below 16px top bar; was 24 — pull toward mid so it isn't glued up. */
+      const int ty = 48;
+      dx[c] = tx - cx0[c];
+      dy[c] = ty - cy0[c];
+    }
+    if (cam_bot >= 0) {
+      const int c = cam_bot;
+      const int gw = cx1[c] - cx0[c];
+      const int gh = cy1[c] - cy0[c];
+      const int tx = (content_w - gw) / 2;
+      /* Raise from bottom margin (was 16) so menu sits nearer wins/W·L. */
+      int ty = 224 - 48 - gh;
+      if (ty < 104)
+        ty = 104; /* keep clear of top band */
+      dx[c] = tx - cx0[c];
+      dy[c] = ty - cy0[c];
+    }
+
+    for (int cam = 0; cam < 2; cam++) {
+      if (cn[cam] == 0)
+        continue;
+      for (unsigned i = 0; i < s_cam_n[cam] && kept < 128u; i++) {
+        const uint8_t *sp = s_cam_spr[cam][i];
+        if (!mw_oam_is_results_ui(sp[3]))
+          continue;
+        const int sx = (int)s_cam_sx[cam][i];
+        const int sy = (int)s_cam_sy[cam][i];
+        if (sx + 64 < x_lo || sx > x_hi)
+          continue;
+        const int x = sx + dx[cam];
+        const int ny = sy + dy[cam];
+        const uint8_t src_h = (uint8_t)(
+            (s_cam_high[cam][i >> 2] >> ((i & 3u) * 2u)) & 2u);
+        mw_present_oam_place(x, ny, sp, src_h, extra, right_hints, kept_x,
+                             kept_y, kept_tile, &kept, 0);
+      }
+    }
+
+    static int reflow_logged;
+    if (!reflow_logged && cam_top >= 0 && cam_bot >= 0) {
+      reflow_logged = 1;
+      fprintf(stderr,
+              "[mw_rtl] H2H results UI reflow: wins/W·L top cam%d (dy=%d) "
+              "menu bottom cam%d (dy=%d)\n",
+              cam_top, dy[cam_top], cam_bot, dy[cam_bot]);
+    }
+  }
+
+  /* ---- local gameplay (skip results UI already stamped) ---- */
   for (unsigned i = 0; i < s_cam_n[local_slot] && kept < 128u; i++) {
     const uint8_t *sp = s_cam_spr[local_slot][i];
+    if (results_ui && mw_oam_is_results_ui(sp[3]))
+      continue;
     const int x = (int)s_cam_sx[local_slot][i];
     if (x + 64 < x_lo || x > x_hi)
       continue;
     const int ny = (int)s_cam_sy[local_slot][i] + y_shift;
-    if (ny < 0 || ny >= 224)
-      continue;
-    if (mw_present_oam_dup(kept_x, kept_y, kept_tile, kept, x, ny, sp[2]))
-      continue;
-    const int lx9 = mw_oam_x9_from_screen(x, extra);
-    const unsigned dst = kept;
-    const int idx = (int)dst * 2;
-    g_ppu->oam[idx] =
-        (uint16_t)(lx9 & 0xff) | ((uint16_t)(uint8_t)ny << 8);
-    g_ppu->oam[idx + 1] = (uint16_t)sp[2] | ((uint16_t)sp[3] << 8);
     const uint8_t src_h = (uint8_t)(
         (s_cam_high[local_slot][i >> 2] >> ((i & 3u) * 2u)) & 2u);
-    const uint8_t hbits =
-        (uint8_t)(src_h | (uint8_t)((lx9 >> 8) & 1));
-    const unsigned dst_byte = dst >> 2;
-    const unsigned dst_sh = (dst & 3u) * 2u;
-    g_ppu->highOam[dst_byte] = (uint8_t)(
-        (g_ppu->highOam[dst_byte] & ~(uint8_t)(3u << dst_sh)) |
-        (uint8_t)(hbits << dst_sh));
-    /* Hint from signed X only — never from x9 band (left-wrap collides). */
-    if (x >= 256 && x < 256 + extra)
-      right_hints[dst >> 3] |= (uint8_t)(1u << (dst & 7u));
-    kept_x[kept] = x;
-    kept_y[kept] = ny;
-    kept_tile[kept] = sp[2];
-    kept++;
+    mw_present_oam_place(x, ny, sp, src_h, extra, right_hints, kept_x, kept_y,
+                         kept_tile, &kept, 6);
   }
 
-  /* ---- other buffer → reproject into local camera ----
-   * Cull to the PPU non-wrap band only. The wider x_hi (+64) used for the
-   * local buffer lets far-right tiles straddle in; encoding those as 9-bit
-   * OAM X (≥256+extra) wraps to the left edge. */
+  /* ---- other buffer → reproject world sprites only (never results UI) ----
+   * $00B1 pillars/platforms: local-cam ownership only — reprojecting the
+   * other half is what tied their screen pos to both cameras. */
   const int reproj_x_lo = -extra - 48;
   const int reproj_x_hi = 256 + extra; /* exclusive: [lo, hi) stays unwrapped */
+  unsigned b1_skip = 0;
   for (unsigned i = 0; i < s_cam_n[other] && kept < 128u; i++) {
     const uint8_t *sp = s_cam_spr[other][i];
+    if (results_ui && mw_oam_is_results_ui(sp[3]))
+      continue;
+    if (s_cam_local_only[other][i]) {
+      b1_skip++;
+      continue;
+    }
     const int ox = (int)s_cam_sx[other][i];
     const int oy = (int)s_cam_sy[other][i];
     const int raw_ny = oy + y_shift;
@@ -2646,31 +3339,20 @@ static int mw_present_oam_from_cam_capture(int local_slot, int extra,
     if (x < reproj_x_lo || x >= reproj_x_hi)
       continue;
     const int ny = sy + y_shift;
-    if (ny < 0 || ny >= 224)
-      continue;
-    if (mw_present_oam_dup(kept_x, kept_y, kept_tile, kept, x, ny, sp[2]))
-      continue;
-    const int lx9 = mw_oam_x9_from_screen(x, extra);
-    const unsigned dst = kept;
-    const int idx = (int)dst * 2;
-    g_ppu->oam[idx] =
-        (uint16_t)(lx9 & 0xff) | ((uint16_t)(uint8_t)ny << 8);
-    g_ppu->oam[idx + 1] = (uint16_t)sp[2] | ((uint16_t)sp[3] << 8);
     const uint8_t src_h = (uint8_t)(
-        (s_cam_high[other][i >> 2] >> ((i & 3u) * 2u)) & 2u); /* size only */
-    const uint8_t hbits =
-        (uint8_t)(src_h | (uint8_t)((lx9 >> 8) & 1));
-    const unsigned dst_byte = dst >> 2;
-    const unsigned dst_sh = (dst & 3u) * 2u;
-    g_ppu->highOam[dst_byte] = (uint8_t)(
-        (g_ppu->highOam[dst_byte] & ~(uint8_t)(3u << dst_sh)) |
-        (uint8_t)(hbits << dst_sh));
-    if (x >= 256 && x < 256 + extra)
-      right_hints[dst >> 3] |= (uint8_t)(1u << (dst & 7u));
-    kept_x[kept] = x;
-    kept_y[kept] = ny;
-    kept_tile[kept] = sp[2];
-    kept++;
+        (s_cam_high[other][i >> 2] >> ((i & 3u) * 2u)) & 2u);
+    mw_present_oam_place(x, ny, sp, src_h, extra, right_hints, kept_x, kept_y,
+                         kept_tile, &kept, 6);
+  }
+  if (b1_skip) {
+    static int b1_logged;
+    if (!b1_logged) {
+      b1_logged = 1;
+      fprintf(stderr,
+              "[mw_rtl] H2H B1 pillar OAM: local-cam ownership "
+              "(skipped %u other-cam reprojects)\n",
+              b1_skip);
+    }
   }
 
   PpuWsSetOamRightHints(g_ppu, right_hints);
@@ -2680,8 +3362,18 @@ static int mw_present_oam_from_cam_capture(int local_slot, int extra,
     logged = 1;
     fprintf(stderr,
             "[mw_rtl] H2H present OAM from cam capture (slot=%d n=%u+%u "
-            "kept=%u, y_shift=%d; other-cam reproject on)\n",
-            local_slot, s_cam_n[local_slot], s_cam_n[other], kept, y_shift);
+            "kept=%u, y_shift=%d; results_ui=%d ui_prio3=%u)\n",
+            local_slot, s_cam_n[local_slot], s_cam_n[other], kept, y_shift,
+            results_ui, ui_n);
+  } else if (results_ui) {
+    static int ui_logged;
+    if (!ui_logged) {
+      ui_logged = 1;
+      fprintf(stderr,
+              "[mw_rtl] H2H results UI ownership: stamp prio3 per-cam "
+              "top/bottom (no y_shift / no cam-delta reproject), ui_n=%u\n",
+              ui_n);
+    }
   }
   (void)kept;
   return 1;
@@ -2798,18 +3490,55 @@ static void mw_h2h_taller_stripe_hook(CpuState *cpu, uint32_t pc24) {
     cpu->A = 0x001Eu;
 }
 
-/* Spawn window top: SBC #$0028 → subtract an extra $80 first (−$A8 total).
- * Full-frame present recenters dual cam by ~$40; the old −$70 left almost no
- * top slop so platforms/props popped on the top edge instead of scrolling in. */
+/* Spawn window top: after SBC #$0028, A → STA $36/$3A (camY−40).
+ * Dual/taller: extra −$80. Expand gameplay: also −Y_SLOP (tall shafts) so
+ * an elevator on another floor stays inside [top, top+$3E). Y-only — does
+ * not touch the shared $8283AC X/Y radius (that regresses object lifetime). */
 static void mw_h2h_taller_spawn_y_hook(CpuState *cpu, uint32_t pc24) {
   (void)pc24;
-  if ((!mw_h2h_taller_armed() && !mw_h2h_vert_widen_armed()) ||
-      !MwIsDualViewport())
+  unsigned sub = 0;
+  if ((mw_h2h_taller_armed() || mw_h2h_spawn_y_widen_armed()) &&
+      MwIsDualViewport())
+    sub = 0x80u;
+  else if (mw_can_expand_gameplay()) {
+    sub = mw_ws_y_lifetime_slop();
+    if (sub > 0xC0u)
+      sub = 0xC0u;
+  }
+  if (sub == 0)
     return;
-  if (cpu->A >= 0x0080u)
-    cpu->A = (uint16_t)(cpu->A - 0x0080u);
+  if (cpu->A >= (uint16_t)sub)
+    cpu->A = (uint16_t)(cpu->A - (uint16_t)sub);
   else
     cpu->A = 0;
+}
+
+/*
+ * $82F62A STA $3E — spawn Y window height after:
+ *   LDA #$0160 / LDX $1EB2 / BEQ +1 / LSR
+ * Dual halves that to #$00B0 (~176px). Elevators on another floor never enter
+ * the map-object scan, so they neither draw nor run until the camera reaches
+ * them. Restore ≥1P height under expand, then add Y_SLOP for tall shafts.
+ */
+static void mw_spawn_y_height_hook(CpuState *cpu, uint32_t pc24) {
+  (void)pc24;
+  if (!mw_can_expand_gameplay())
+    return;
+  uint32_t h = cpu->A;
+  if (h < 0x0160u)
+    h = 0x0160u;
+  h += (uint32_t)mw_ws_y_lifetime_slop();
+  if (h > 0xFFFFu)
+    h = 0xFFFFu;
+  cpu->A = (uint16_t)h;
+  static int logged;
+  if (!logged) {
+    logged = 1;
+    fprintf(stderr,
+            "[mw_rtl] spawn Y height $3E → $%04X (dual native #$00B0; "
+            "SNESRECOMP_MW_Y_SLOP=0 for 1P #$0160 only)\n",
+            (unsigned)cpu->A);
+  }
 }
 
 /* Pre-ADC #$0070 at $80B99B / $80B9EF: cancel dual half-screen Y bias so OAM
@@ -2821,26 +3550,46 @@ static void mw_h2h_taller_y_bias_hook(CpuState *cpu, uint32_t pc24) {
   cpu->A = (uint16_t)(cpu->A - 0x0070u);
 }
 
+/* Offline 1P: widen meta-sprite Y CMPs without dual OAM +$78 bias.
+ * Native #$68/#$70 is a ~half-screen draw clip — elevators/mechs vanish
+ * outside that band. SNESRECOMP_MW_1P_Y_WIDEN=0 disables. */
+static int mw_1p_y_draw_widen_armed(void) {
+  static int v = -1;
+  if (v < 0) {
+    const char *e = getenv("SNESRECOMP_MW_1P_Y_WIDEN");
+    if (e && e[0] == '0')
+      v = 0;
+    else
+      v = 1; /* default on */
+  }
+  return v != 0;
+}
+
 /*
- * Patch dual Y-window CMP immediates in ROM (interp fetches these). Never
+ * Patch Y-window CMP immediates in ROM (interp fetches these). Never
  * rewrite A at the CMP — meta paths STA $14C5 from the same A.
  *   Bottom: #$0068 / #$0070 → #$00E0 (full-frame down; was #$78 with bias)
  *           native #$00E0 sites stay #$E0 (do NOT narrow — that clipped mechs)
  *   Top:    #$FFF1 → #$FF70 (−144)
- *   List:   keep native #$00A8 (do NOT widen to #$0140 — that listed P2-floor
- *           objects via cam1 Y when players share a height band, so dual P1
- *           halves sprayed wrap/left-margin junk into cam0 capture).
- * Staging still uses +$78 for negative sy; capture stores pre-bias sy so
- * bottom sprites with biased Y≥$F0 still present. Apply only while dual+
- * vert-widen; restore natives on title/menus.
+ *   List:   #$00A8 → #$00E0 under widen. Native #$A8 drops the whole object
+ *           when the anchor crosses 168 — with full-frame y_shift that pops
+ *           tall sprites while upper tiles are still on-screen. Match the
+ *           per-tile bottom (#$E0) so parts can slide off via PPU clip.
+ *           Do NOT use #$0140 (P2-floor objects leaked into cam0 capture).
+ * Modes: 0 = native, 1 = offline 1P draw widen (no OAM bias), 4 = dual
+ * H2H vert-widen (+ bias hooks elsewhere). $8283AC radius is X-heavy and
+ * does not fix this clip.
  */
 static void mw_h2h_vert_widen_patch_imm(void) {
   if (!g_snes || !g_snes->cart)
     return;
-  /* 4 = top FF70 + bottom E0, list stays #$A8; 3 widened list too (bad). */
-  const int want =
-      (mw_h2h_vert_widen_armed() && MwIsDualViewport()) ? 4 : 0;
-  static int applied = -1; /* -1 unknown, 0 native, 4 dual-widen */
+  int want = 0;
+  if (mw_h2h_vert_widen_armed() && MwIsDualViewport())
+    want = 4;
+  else if (mw_1p_y_draw_widen_armed() && !MwIsDualViewport() &&
+           mw_can_expand_gameplay())
+    want = 1;
+  static int applied = -1; /* -1 unknown, 0 native, 1 = 1P, 4 = dual */
   if (applied == want)
     return;
 
@@ -2857,12 +3606,13 @@ static void mw_h2h_vert_widen_patch_imm(void) {
   };
   static const uint16_t kCmpA8[] = {0x9280u, 0x92A0u};
 
+  const int widen = (want != 0);
   int n = 0;
   for (size_t i = 0; i < sizeof(kCmp68) / sizeof(kCmp68[0]); i++) {
     uint8_t *p = cart_getRomPtr(g_snes->cart, 0x80, kCmp68[i]);
     if (p && p[0] == 0xC9u && p[2] == 0x00u &&
         (p[1] == 0x68u || p[1] == 0x78u || p[1] == 0xE0u)) {
-      const uint8_t v = want ? 0xE0u : 0x68u;
+      const uint8_t v = widen ? 0xE0u : 0x68u;
       if (p[1] != v) {
         p[1] = v;
         n++;
@@ -2873,7 +3623,7 @@ static void mw_h2h_vert_widen_patch_imm(void) {
     uint8_t *p = cart_getRomPtr(g_snes->cart, 0x80, kCmp70[i]);
     if (p && p[0] == 0xC9u && p[2] == 0x00u &&
         (p[1] == 0x70u || p[1] == 0x78u || p[1] == 0xE0u)) {
-      const uint8_t v = want ? 0xE0u : 0x70u;
+      const uint8_t v = widen ? 0xE0u : 0x70u;
       if (p[1] != v) {
         p[1] = v;
         n++;
@@ -2897,30 +3647,39 @@ static void mw_h2h_vert_widen_patch_imm(void) {
     /* Native #$FFF1; widen #$FF90 (old) or #$FF70 (current). */
     if (p && p[0] == 0xC9u && p[2] == 0xFFu && p[3] == 0xB0u &&
         (p[1] == 0xF1u || p[1] == 0x90u || p[1] == 0x70u)) {
-      const uint8_t v = want ? 0x70u : 0xF1u;
+      const uint8_t v = widen ? 0x70u : 0xF1u;
       if (p[1] != v) {
         p[1] = v;
         n++;
       }
     }
   }
-  /* Always restore native dual-list #$A8 (undo older #$0140 widen). */
+  /* Active-list Y: #$A8 → #$E0 when widening (undo #$0140 if present). */
   for (size_t i = 0; i < sizeof(kCmpA8) / sizeof(kCmpA8[0]); i++) {
     uint8_t *p = cart_getRomPtr(g_snes->cart, 0x80, kCmpA8[i]);
     if (!p || p[0] != 0xC9u)
       continue;
-    if (p[1] == 0x40u && p[2] == 0x01u) {
-      p[1] = 0xA8u;
+    const uint8_t want_lo = widen ? 0xE0u : 0xA8u;
+    if (p[2] == 0x01u && p[1] == 0x40u) {
+      /* Stale #$0140 → target. */
+      p[1] = want_lo;
       p[2] = 0x00u;
       n++;
+    } else if (p[2] == 0x00u &&
+               (p[1] == 0xA8u || p[1] == 0xE0u || p[1] == 0xF0u)) {
+      if (p[1] != want_lo) {
+        p[1] = want_lo;
+        n++;
+      }
     }
   }
   applied = want;
   if (n)
     fprintf(stderr,
-            "[mw_rtl] H2H vert-widen: %s %d Y CMP immediates "
-            "(dual=%d top=FF70 bot=E0 list=A8)\n",
-            want ? "patched" : "restored", n, want != 0);
+            "[mw_rtl] Y-draw widen: %s %d CMP immediates "
+            "(mode=%d top=FF70 bot=E0 list=%s)\n",
+            widen ? "patched" : "restored", n, want,
+            widen ? "E0" : "A8");
 }
 
 /* Dual bottom-Y CMP — start of a P1 sprite (before optional ADC #$78). */
@@ -3052,8 +3811,69 @@ static void mw_h2h_oam_full_wrap_hook(CpuState *cpu, uint32_t pc24) {
   }
 }
 
+/*
+ * Native BG2 stripe loop: INX/INX / CPX #$10 / BNE — only 8 map rows per
+ * frame. With 16×16 tiles that is 128px, so elevators/platforms on idle BG2
+ * vanish outside a half-screen Y band while BG1 (full $1E9C rows) still
+ * draws the shaft. VMADD tables at $83:857C / $83:864C hold 12 valid row
+ * words before junk — widen to CPX #$18 (12 rows ≈ 192px). CPX sites:
+ * $809334, $80A88C.
+ *
+ * Only for netplay or active widescreen expand. Offline dual ($1EB2) still
+ * makes mw_can_expand_gameplay() true, but a 12-row DMA stomps the native
+ * 16-line HDMA seam HUD (direction arrows) — bar only flashes when the
+ * arrow state is rewritten. SNESRECOMP_MW_BG2_ROWS=0 disables; =16 tries 16.
+ */
+static void mw_bg2_stripe_rows_patch(void) {
+  if (!g_snes || !g_snes->cart)
+    return;
+  static int rows = -2; /* -2 unset, 0 off, else row count */
+  if (rows == -2) {
+    const char *e = getenv("SNESRECOMP_MW_BG2_ROWS");
+    if (e && e[0] == '0' && e[1] == '\0')
+      rows = 0;
+    else if (e && e[0] >= '1' && e[0] <= '9') {
+      rows = atoi(e);
+      if (rows < 8)
+        rows = 8;
+      if (rows > 16)
+        rows = 16;
+    } else
+      rows = 12; /* default: full 857C table when expand allowed */
+  }
+  /* Dual offline has WS hard-off — keep native 8 so the center seam HUD
+   * stays intact. Netplay / 1P widescreen may widen. */
+  const int expand_ok =
+      mw_can_expand_gameplay() &&
+      (snes_netplay_active() || (g_ws_active && g_ws_extra > 0));
+  const int want = (rows > 8 && expand_ok) ? rows : 8;
+  const uint8_t imm = (uint8_t)(want * 2); /* X steps by 2 */
+  static int applied = -1;
+  if (applied == want)
+    return;
+  static const uint16_t kCpx[] = {0x9334u, 0xA88Cu};
+  int n = 0;
+  for (size_t i = 0; i < sizeof(kCpx) / sizeof(kCpx[0]); i++) {
+    uint8_t *p = cart_getRomPtr(g_snes->cart, 0x80, kCpx[i]);
+    /* CPX #imm8 : E0 nn  (SEP #$10 → 8-bit X) */
+    if (!p || p[0] != 0xE0u)
+      continue;
+    if (p[1] != 0x10u && p[1] != 0x18u && p[1] != 0x20u)
+      continue;
+    if (p[1] != imm) {
+      p[1] = imm;
+      n++;
+    }
+  }
+  applied = want;
+  if (n)
+    fprintf(stderr, "[mw_rtl] BG2 stripe rows: %d (CPX #$%02X, %d site(s))\n",
+            want, (unsigned)imm, n);
+}
+
 static void mw_install_dma_widen_hooks(void) {
   mw_h2h_vert_widen_patch_imm();
+  mw_bg2_stripe_rows_patch();
   static int done;
   if (done)
     return;
@@ -3104,6 +3924,9 @@ static void mw_install_dma_widen_hooks(void) {
   interp_bridge_set_pre_opcode_hook(0x828397u, mw_bbox_left_bcc_hook);
   interp_bridge_set_pre_opcode_hook(0x828383u, mw_bbox_right_bcs_hook);
   interp_bridge_set_pre_opcode_hook(0x82839Cu, mw_bbox_right_bcs_hook);
+  /* $00B1 pillars: dual bbox OR → nearer-cam ownership only. */
+  interp_bridge_set_pre_opcode_hook(0x82838Du, mw_b1_bbox_cam0_success_hook);
+  interp_bridge_set_pre_opcode_hook(0x8283A6u, mw_b1_bbox_cam1_y_hook);
   interp_bridge_set_pre_opcode_hook(0x809B43u, mw_bbox_padded_left_bcc_hook);
   interp_bridge_set_pre_opcode_hook(0x80A5ABu, mw_obj_onscreen_entry_hook);
   interp_bridge_set_pre_opcode_hook(0x80A5B6u, mw_obj_onscreen_bmi_hook);
@@ -3122,6 +3945,7 @@ static void mw_install_dma_widen_hooks(void) {
   interp_bridge_set_pre_opcode_hook(0x808721u, mw_draw_meta_hook);
   /* Phase 2b taller H2H: dual stripe rows + spawn Y window + OAM Y bias. */
   interp_bridge_set_pre_opcode_hook(0x8095A9u, mw_h2h_taller_stripe_hook);
+  interp_bridge_set_pre_opcode_hook(0x82F62Au, mw_spawn_y_height_hook);
   interp_bridge_set_pre_opcode_hook(0x82F709u, mw_h2h_taller_spawn_y_hook);
   interp_bridge_set_pre_opcode_hook(0x82F721u, mw_h2h_taller_spawn_y_hook);
   interp_bridge_set_pre_opcode_hook(0x82F733u, mw_h2h_taller_spawn_y_hook);
@@ -3697,11 +4521,17 @@ void MwDrawPpuFrameLocalFull(int local_slot) {
    * Stable half→full Y (no OAM focus).
    * Cam-capture path stores pre-bias sy and applies y_oam at present.
    * Fallback (tag/half cull) still uses biased staging + oam_delta.
+   * Snap to BG1 tile height so (cam_y_raw - y_bg) keeps the same fine
+   * phase — a non-multiple nudge slides $7F strips vs camera-locked OAM
+   * (moving ledges look ~1 tile off under the mech).
    */
   enum { kMwH2hBgNudge = 8 };
   const int oam_bias = mw_h2h_oam_y_bias();
   const int y_base = mw_h2h_full_frame_y_shift();
-  const int y_bg = y_base + kMwH2hBgNudge;
+  const int tile_px = (g_ppu && PPU_bigTiles(g_ppu, 0)) ? 16 : 8;
+  int y_bg = y_base + kMwH2hBgNudge;
+  if (tile_px > 0)
+    y_bg -= y_bg % tile_px;
   const int y_oam = y_bg;
   const uint16_t cam_y = mw_u16_sub_sat(cam_y_raw, y_bg);
   const int oam_delta = -oam_bias + y_oam;
@@ -3728,7 +4558,9 @@ void MwDrawPpuFrameLocalFull(int local_slot) {
     v1 = v0;
   }
 
-  mw_present_rebuild_local_strips(cam_x, cam_y, h0, v0, h1, v1, bg2_stream);
+  const int bg1_rebuild = mw_h2h_bg1_rebuild_armed();
+  mw_present_rebuild_local_strips(cam_x, cam_y, h0, v0, h1, v1, bg1_rebuild,
+                                  bg2_stream, cam_y_raw);
   mw_present_restamp_bg2_from_rom();
 
   uint16_t oam_backup[0x100];
