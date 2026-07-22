@@ -50,6 +50,7 @@
 #include "snes_lobby_client.h"
 #endif
 #include "snes_netplay.h"
+#include "recomp_net/address.h"
 #include "recomp_net/lan_lobby.h"
 
 typedef struct GamepadInfo {
@@ -164,6 +165,10 @@ static char g_launcher_lobby_url[256];
 static int g_launcher_hosting_lan;
 static int g_launcher_joined_lan;
 static RecompLauncherCNetplayLaunch g_launcher_lan_launch;
+#define LAUNCHER_MAX_LOCAL_ADDRESSES 32
+static RNetIpv4Address
+    g_launcher_local_addresses[LAUNCHER_MAX_LOCAL_ADDRESSES];
+static int g_launcher_local_address_count;
 
 static const char *LauncherLanLobbyPath(void) {
   return "netplay_lan_lobby.txt";
@@ -306,49 +311,35 @@ static int LauncherNpListGet(void *ctx, int index,
   return 1;
 }
 
-static int LauncherNpLocalIp(void *ctx, char *out, size_t out_len) {
-  struct sockaddr_in dst;
-  struct sockaddr_in local;
-#ifdef _WIN32
-  SOCKET sock;
-  int local_len = (int)sizeof(local);
-  static int wsa_ready;
-  if (!wsa_ready) {
-    WSADATA data;
-    if (WSAStartup(MAKEWORD(2, 2), &data) != 0) return 0;
-    wsa_ready = 1;
-  }
-#else
-  int sock;
-  socklen_t local_len = (socklen_t)sizeof(local);
-#endif
+static int LauncherRefreshLocalAddresses(void) {
+  int count = rnet_ipv4_enumerate(
+      g_launcher_local_addresses, LAUNCHER_MAX_LOCAL_ADDRESSES);
+  if (count < 0) count = 0;
+  if (count > LAUNCHER_MAX_LOCAL_ADDRESSES)
+    count = LAUNCHER_MAX_LOCAL_ADDRESSES;
+  g_launcher_local_address_count = count;
+  return count;
+}
+
+static int LauncherNpLocalAddressGet(
+    void *ctx, int index, RecompLauncherCNetplayLocalAddress *out) {
   (void)ctx;
-  if (!out || !out_len) return 0;
-  memset(&dst, 0, sizeof(dst));
-  dst.sin_family = AF_INET;
-  dst.sin_port = htons(80);
-  if (inet_pton(AF_INET, "8.8.8.8", &dst.sin_addr) != 1) return 0;
-  sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-#ifdef _WIN32
-  if (sock == INVALID_SOCKET) return 0;
-#else
-  if (sock < 0) return 0;
-#endif
-  if (connect(sock, (struct sockaddr *)&dst, sizeof(dst)) != 0 ||
-      getsockname(sock, (struct sockaddr *)&local, &local_len) != 0) {
-#ifdef _WIN32
-    closesocket(sock);
-#else
-    close(sock);
-#endif
+  if (!out || index < 0) return 0;
+  if (index == 0) LauncherRefreshLocalAddresses();
+  if (index >= g_launcher_local_address_count) return 0;
+  memset(out, 0, sizeof(*out));
+  snprintf(out->address, sizeof(out->address), "%s",
+           g_launcher_local_addresses[index].address);
+  snprintf(out->label, sizeof(out->label), "%s",
+           g_launcher_local_addresses[index].interface_label);
+  return 1;
+}
+
+static int LauncherNpLocalIp(void *ctx, char *out, size_t out_len) {
+  RecompLauncherCNetplayLocalAddress address;
+  if (!out || !out_len || !LauncherNpLocalAddressGet(ctx, 0, &address))
     return 0;
-  }
-  if (!inet_ntop(AF_INET, &local.sin_addr, out, out_len)) out[0] = '\0';
-#ifdef _WIN32
-  closesocket(sock);
-#else
-  close(sock);
-#endif
+  snprintf(out, out_len, "%s", address.address);
   return out[0] != '\0';
 }
 
@@ -589,6 +580,7 @@ static RecompLauncherCNetplayCallbacks g_launcher_netplay_callbacks = {
   LauncherNpLaunchPending,
   LauncherNpClearLaunchPending,
   LauncherNpFillLaunch,
+  LauncherNpLocalAddressGet,
 };
 #endif
 
