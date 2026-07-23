@@ -1976,96 +1976,103 @@ static void netplay_soft_exit(const char *origin) {
                            origin ? origin : "?");
 }
 
-/*
- * MotK netplay_barrier_admit: stage + poll until INPUT_CONFIRM hash agrees.
- * Returns 1 if admitted (caller owes RtlRunFrame + finish_frame), 0 if the
- * session ended or the caller should skip the sim tick (*running may clear).
- */
-static int NetplayBarrierAdmit(bool *running) {
-  static int desync_logged = 0;
-  if (!snes_netplay_active()) return 0;
+#define MW_NETPLAY_PEER_TIMEOUT_MS 1500u
+#define MW_NETPLAY_CONNECT_TIMEOUT_MS 30000u
 
-  for (;;) {
-    uint32_t dt = 0, lh = 0, rh = 0;
-    SDL_Event ev;
+static uint16_t MwNetplayCapturePad(void *ctx) {
+  (void)ctx;
+  RefreshKeybindControllerBits();
+  return CaptureLocalNetplayButtons();
+}
 
-    if (snes_netplay_peer_disconnected(1500u)) {
-      netplay_soft_exit("peer_disconnect");
-      desync_logged = 0;
-      if (running && snes_netplay_return_to_lobby_requested())
-        *running = false;
-      return 0;
+static void MwNetplayPollEvents(void *ctx, int *want_soft_exit) {
+  SDL_Event ev;
+  (void)ctx;
+  if (!want_soft_exit) return;
+  while (SDL_PollEvent(&ev)) {
+    if (ev.type == SDL_QUIT) {
+      *want_soft_exit = 2;
+      if (g_netplay_from_lobby)
+        host_report_breadcrumb(
+            "netplay: ended (sdl_quit) — returning to lobby");
+      return;
     }
-    if (snes_netplay_input_desync(&dt, &lh, &rh)) {
-      if (!desync_logged) {
-        fprintf(stderr,
-                "snes_netplay: INPUT desync tick=%u local=%08x remote=%08x — stalled\n",
-                (unsigned)dt, (unsigned)lh, (unsigned)rh);
-        desync_logged = 1;
-      }
-      SDL_Delay(16);
-      while (SDL_PollEvent(&ev)) {
-        if (ev.type == SDL_QUIT) {
-          netplay_soft_exit("sdl_quit");
-          if (running) *running = false;
-          return 0;
-        }
-        if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_ESCAPE) {
-          netplay_soft_exit("escape");
-          desync_logged = 0;
-          if (running && snes_netplay_return_to_lobby_requested())
-            *running = false;
-          return 0;
-        }
-      }
-      continue;
+    if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_ESCAPE) {
+      *want_soft_exit = 1;
+      if (g_netplay_from_lobby)
+        host_report_breadcrumb(
+            "netplay: ended (escape) — returning to lobby");
+      return;
     }
-
-    RefreshKeybindControllerBits();
-    if (snes_netplay_needs_local_sample())
-      snes_netplay_stage_local(CaptureLocalNetplayButtons());
-    if (snes_netplay_poll_admit()) {
-      desync_logged = 0;
-      return 1;
-    }
-
-    while (SDL_PollEvent(&ev)) {
-      if (ev.type == SDL_QUIT) {
-        netplay_soft_exit("sdl_quit");
-        if (running) *running = false;
-        return 0;
+    if (ev.type == SDL_CONTROLLERDEVICEADDED)
+      OpenOneGamepad(ev.cdevice.which);
+    else if (ev.type == SDL_CONTROLLERDEVICEREMOVED) {
+      GamepadInfo *gi = GetGamepadInfo(ev.cdevice.which);
+      if (gi) {
+        memset(gi, 0, sizeof(GamepadInfo));
+        gi->joystick_id = -1;
       }
-      if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_ESCAPE) {
-        netplay_soft_exit("escape");
-        if (running && snes_netplay_return_to_lobby_requested())
-          *running = false;
-        return 0;
-      }
-      if (ev.type == SDL_CONTROLLERDEVICEADDED)
-        OpenOneGamepad(ev.cdevice.which);
-      else if (ev.type == SDL_CONTROLLERDEVICEREMOVED) {
-        GamepadInfo *gi = GetGamepadInfo(ev.cdevice.which);
-        if (gi) {
-          memset(gi, 0, sizeof(GamepadInfo));
-          gi->joystick_id = -1;
-        }
-      } else if (ev.type == SDL_CONTROLLERAXISMOTION) {
-        GamepadInfo *gi = GetGamepadInfo(ev.caxis.which);
-        if (gi)
-          HandleGamepadAxisInput(gi, ev.caxis.axis, ev.caxis.value);
-      } else if (ev.type == SDL_CONTROLLERBUTTONDOWN ||
-                 ev.type == SDL_CONTROLLERBUTTONUP) {
-        GamepadInfo *gi = GetGamepadInfo(ev.cbutton.which);
-        if (gi) {
-          int b = RemapSdlButton(ev.cbutton.button);
-          if (b >= 0)
-            HandleGamepadInput(gi, b, ev.type == SDL_CONTROLLERBUTTONDOWN);
-        }
+    } else if (ev.type == SDL_CONTROLLERAXISMOTION) {
+      GamepadInfo *gi = GetGamepadInfo(ev.caxis.which);
+      if (gi)
+        HandleGamepadAxisInput(gi, ev.caxis.axis, ev.caxis.value);
+    } else if (ev.type == SDL_CONTROLLERBUTTONDOWN ||
+               ev.type == SDL_CONTROLLERBUTTONUP) {
+      GamepadInfo *gi = GetGamepadInfo(ev.cbutton.which);
+      if (gi) {
+        int b = RemapSdlButton(ev.cbutton.button);
+        if (b >= 0)
+          HandleGamepadInput(gi, b, ev.type == SDL_CONTROLLERBUTTONDOWN);
       }
     }
-    SDL_Delay(1);
   }
 }
+
+static void MwNetplayOnConnectTimeout(void *ctx) {
+  const char *suppress_dialog = getenv("SNES_NET_SUPPRESS_ERROR_DIALOG");
+  const int is_ice = strcmp(snes_netplay_transport_name(), "ice") == 0;
+  const char *error_code =
+      is_ice ? "connect_timeout_ice" : "connect_timeout_lan";
+  const char *message =
+      is_ice
+          ? "Could not establish an online connection to the other "
+            "player within 30 seconds.\n\nAllow the game through the "
+            "Windows firewall, make sure both players are still in the "
+            "lobby, then rejoin and retry."
+          : "Could not establish a direct connection to the other "
+            "player within 30 seconds.\n\nCheck the lobby address, "
+            "firewall, and that both players are still connected, then "
+            "rejoin and retry.";
+  (void)ctx;
+  snes_host_lobby_set_runtime_error(error_code);
+  fprintf(stderr, "snes_netplay: %s: %s\n", error_code, message);
+  host_report_breadcrumb("netplay: error=%s transport=%s", error_code,
+                         snes_netplay_transport_name());
+  if ((!suppress_dialog || suppress_dialog[0] == '\0' ||
+       suppress_dialog[0] == '0') &&
+      message) {
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,
+                             "Metal Warriors Netplay Connection Failed",
+                             message, g_window);
+  }
+}
+
+/* Thin wrapper — admit / connect-wait clock live in snes_host_barrier_admit. */
+static int NetplayBarrierAdmit(bool *running) {
+  SnesHostBarrierHooks hooks;
+  int run = running && *running ? 1 : 0;
+  int ok;
+  memset(&hooks, 0, sizeof(hooks));
+  hooks.capture_local_pad = &MwNetplayCapturePad;
+  hooks.poll_events = &MwNetplayPollEvents;
+  hooks.peer_timeout_ms = MW_NETPLAY_PEER_TIMEOUT_MS;
+  hooks.connect_timeout_ms = MW_NETPLAY_CONNECT_TIMEOUT_MS;
+  hooks.on_connect_timeout = &MwNetplayOnConnectTimeout;
+  ok = snes_host_barrier_admit(g_netplay_from_lobby, &run, &hooks);
+  if (running) *running = run != 0;
+  return ok;
+}
+
 
 static void OpenOneGamepad(int i) {
   if (SDL_IsGameController(i)) {

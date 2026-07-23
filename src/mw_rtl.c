@@ -814,6 +814,19 @@ static void mw_bg1_snap_capture(int slot, uint16_t cam_x, uint16_t cam_y,
   if (solid == 0 && s_bg1_snap[slot].valid)
     return;
   MwBg1Snap *snap = &s_bg1_snap[slot];
+  /* Dual often stomps only the 17-col stripe; west of src goes void while
+   * the strip stays solid. Merging keeps prior west history for the left
+   * widescreen gutter (DMA pad_left is always 0). */
+  if (snap->valid && snap->src &&
+      mw_bg1_src_same_column(src, snap->src, pitch)) {
+    for (int row = 0; row < kMwBg1SnapRows; row++) {
+      for (int c = 0; c < kMwBg1SnapWest; c++) {
+        if (mw_bg1_tile_weak(words[row][c]) &&
+            !mw_bg1_tile_weak(snap->words[row][c]))
+          words[row][c] = snap->words[row][c];
+      }
+    }
+  }
   memcpy(snap->words, words, sizeof(words));
   snap->src = src;
   snap->pitch = pitch;
@@ -875,7 +888,14 @@ static void mw_bg1_note_dma_src(uint16_t src) {
 
 /* `col` is relative to `src` (may be negative for west gutter). Maps through
  * snap->src allowing both row and column deltas — DMA sticky often sits a
- * few tile-columns east of the present $42B3 base. */
+ * few tile-columns east of the present $42B3 base.
+ *
+ * Native strip (col >= 0): require same dual-cam column and small d_cols so
+ * we never remap a peer stripe / far-east mover dirt into 4:3.
+ * West history (col < 0): allow column remap — left widescreen has no DMA
+ * pad (VMADD col 0 ⇒ pad_left=0); geometry only comes from snap/$7F west.
+ * same_column reject there emptied the left margin while right DMA pad still
+ * painted. */
 static uint16_t mw_bg1_snap_word(int slot, uint16_t src, uint16_t pitch,
                                  int row, int col) {
   if (slot != 0 && slot != 1)
@@ -886,9 +906,8 @@ static uint16_t mw_bg1_snap_word(int slot, uint16_t src, uint16_t pitch,
   int p = pitch ? (int)pitch : (int)snap->pitch;
   if (p < 32)
     p = 0x290;
-  /* Full-frame: reject snap captured on a different dual-cam column so west
-   * / new cols do not remap the peer's stripe into this present. */
-  if (s_present_h2h_full_frame && src && snap->src &&
+  const int west = col < 0;
+  if (!west && s_present_h2h_full_frame && src && snap->src &&
       !mw_bg1_src_same_column(src, snap->src, (uint16_t)p))
     return 0;
   const int delta = (int)src - (int)snap->src;
@@ -897,9 +916,9 @@ static uint16_t mw_bg1_snap_word(int slot, uint16_t src, uint16_t pitch,
   if (rem & 1)
     return 0;
   const int d_cols = rem / 2;
-  /* Cap column remap — large d_cols were pulling far-east mover cells into
-   * the west gutter / native strip. */
-  if (d_cols > kMwBg1SnapWest || d_cols < -kMwBg1SnapWest)
+  /* Native strip: cap remap. West: rely on snap buffer bounds only. */
+  if (!west &&
+      (d_cols > kMwBg1SnapWest || d_cols < -kMwBg1SnapWest))
     return 0;
   const int rr = row + d_rows;
   const int cc = col + d_cols + kMwBg1SnapWest;
@@ -2248,6 +2267,48 @@ static void mw_capture_vram_pad_cols(int layer, uint16_t src0, uint32_t world_x,
   }
 }
 
+/* Rebuild paints west into wrapped VRAM (col < 0); Frame only captures the
+ * native view. Copy those VRAM words into shadow — $7F may already be dual-
+ * stomped by present time while rebuild still had snap west. */
+static void mw_capture_vram_west_cols(int layer, uint32_t world_x,
+                                      uint32_t world_y, uint16_t scroll_x,
+                                      uint16_t scroll_y) {
+  if (!g_ppu || !g_ws_active || !s_shadow_world_valid)
+    return;
+  const int pad = mw_ws_tile_pad();
+  if (pad <= 0)
+    return;
+  const unsigned sh = PPU_bigTiles(g_ppu, layer) ? 4u : 3u;
+  const int rows = sh == 4u ? 16 : 29;
+  const uint32_t tx0 = world_x >> sh;
+  const uint32_t ty0 = world_y >> sh;
+  if (tx0 == 0)
+    return;
+  const uint32_t buf_tx0 = (uint32_t)scroll_x >> sh;
+  const uint32_t buf_ty0 = (uint32_t)scroll_y >> sh;
+  const uint16_t map_base = (uint16_t)PPU_bgTilemapAdr(g_ppu, layer);
+  const int x_mask = PPU_bgTilemapWider(g_ppu, layer) ? 63 : 31;
+  const int map_period = x_mask + 1;
+
+  for (int d = 1; d <= pad; d++) {
+    if (tx0 < (uint32_t)d)
+      break;
+    int map_col = ((int)buf_tx0 - d) % map_period;
+    if (map_col < 0)
+      map_col += map_period;
+    const int half = (x_mask > 31 && map_col >= 32) ? 0x400 : 0;
+    for (int row = 0; row < rows; row++) {
+      const int map_row = (int)((buf_ty0 + (uint32_t)row) & 31u);
+      const uint16_t word =
+          (uint16_t)(map_base + half + (map_row << 5) + (map_col & 31));
+      const uint16_t t = g_ppu->vram[word & 0x7fffu];
+      if (t == 0 || t == 0x0DAEu || t == 0x0200u)
+        continue;
+      WsShadowForceTile(layer, tx0 - (uint32_t)d, ty0 + (uint32_t)row, t);
+    }
+  }
+}
+
 static void mw_log_7f_vram_align(void) {
   static unsigned logs;
   extern int snes_frame_counter;
@@ -2427,10 +2488,18 @@ static void mw_prefill_margins_from_map_ex(const uint16_t *cam_x_override,
       single_cam ? *cam_y_override
                  : (s_nmi_latched ? s_nmi_cam2_y : mw_wram16(0x1E1C));
 
-  const uint32_t world1_x = mw_shadow_world(cam1_x, hs0);
-  const uint32_t world1_y = mw_shadow_world(cam1_y, vs0);
-  const uint32_t world2_x = mw_shadow_world(cam2_x, hs1);
-  const uint32_t world2_y = mw_shadow_world(cam2_y, vs1);
+  /* H2H full-frame SetWorld uses raw cam (see MwDrawPpuFrameLocalFull).
+   * ForceTile keys must match that origin — mw_shadow_world(cam, scroll)
+   * drifts by up to a tile when the strip lags, so left-gutter ink lands
+   * on keys the margin sampler never reads (empty history side). */
+  const uint32_t world1_x =
+      single_cam ? (uint32_t)cam1_x : mw_shadow_world(cam1_x, hs0);
+  const uint32_t world1_y =
+      single_cam ? (uint32_t)cam1_y : mw_shadow_world(cam1_y, vs0);
+  const uint32_t world2_x =
+      single_cam ? (uint32_t)cam2_x : mw_shadow_world(cam2_x, hs1);
+  const uint32_t world2_y =
+      single_cam ? (uint32_t)cam2_y : mw_shadow_world(cam2_y, vs1);
 
   const uint16_t src1_live =
       s_nmi_latched ? s_nmi_src_bg1 : mw_wram16(0x1E36);
@@ -2482,6 +2551,8 @@ static void mw_prefill_margins_from_map_ex(const uint16_t *cam_x_override,
       if (use_src2)
         mw_prefill_layer_from_map(1, use_src2, world2_x, world2_y, true, false,
                                   0);
+      /* Rebuild→VRAM west beats dual-stomped $7F at present time. */
+      mw_capture_vram_west_cols(0, world1_x, world1_y, hs0, vs0);
     }
     if (right7f) {
       mw_prefill_layer_from_map(0, use_src1, world1_x, world1_y, false, true,
@@ -3455,6 +3526,13 @@ static void mw_vram_restore(void) {
   s_vram_save_n = 0;
 }
 
+/* Defined with stage-prop blank — used while painting native 4:3 cols. */
+static int mw_prop_foreign_ink_tile(int wx, int wy, uint16_t tile,
+                                    int local_slot, uint16_t c0x, uint16_t c0y,
+                                    uint16_t c1x, uint16_t c1y,
+                                    uint16_t scroll_x);
+static uint16_t mw_bg1_under_at_world(int wx, int wy);
+
 /*
  * Rebuild one layer's streaming strip from $7F into VRAM for present only
  * (matches game DMA: view cols + fine overhang + widescreen pad_right).
@@ -3574,6 +3652,16 @@ static void mw_present_rebuild_layer_strip(int layer, uint16_t cam_x,
       (layer == 0 && (local_slot == 0 || local_slot == 1) &&
        s_bg1_snap[local_slot].valid);
 
+  /* Cams for foreign-ink filter on native 4:3 cols (not west gutter). */
+  const uint16_t filt_c0x =
+      s_nmi_latched ? s_nmi_cam_x : mw_wram16(0x1E16u);
+  const uint16_t filt_c0y =
+      s_nmi_latched ? s_nmi_cam_y : mw_wram16(0x1E18u);
+  const uint16_t filt_c1x =
+      s_nmi_latched ? s_nmi_cam2_x : mw_wram16(0x1E1Au);
+  const uint16_t filt_c1y =
+      s_nmi_latched ? s_nmi_cam2_y : mw_wram16(0x1E1Cu);
+
   for (int row = 0; row < n_rows; row++) {
     const int map_row = (int)((buf_ty0 + (uint32_t)row) & 31u);
     for (int col = col_lo; col < col_hi; col++) {
@@ -3609,6 +3697,19 @@ static void mw_present_rebuild_layer_strip(int layer, uint16_t cam_x,
         } else {
           t = live_t;
         }
+      }
+      /*
+       * Native 4:3 cols only: drop foreign ledge fingerprint. West/history
+       * cols (col < 0) are a different path — ghosts live in the DMA window.
+       */
+      if (layer == 0 && s_present_h2h_full_frame && col >= 0 &&
+          col < view_cols && !mw_bg1_tile_void(t) && t != 0x0200u) {
+        const int tile_px = 1 << (int)sh;
+        const int wx = (int)scroll_x + col * tile_px + tile_px / 2;
+        const int wy = (int)scroll_y + row * tile_px + tile_px / 2;
+        if (mw_prop_foreign_ink_tile(wx, wy, t, local_slot, filt_c0x, filt_c0y,
+                                     filt_c1x, filt_c1y, scroll_x))
+          t = mw_bg1_under_at_world(wx, wy);
       }
       g_ppu->vram[vaddr & 0x7fffu] = t;
     }
@@ -3701,17 +3802,56 @@ static void mw_bg1_blank_world(uint16_t wx, uint16_t wy, uint16_t scroll_x,
   g_ppu->vram[(unsigned)va & 0x7fffu] = under;
 }
 
-/* Blank a tall/wide band around a world point (stripe + brown body).
- * Pocket only — full-strip blank regressed stabilized map terrain. */
-static unsigned mw_prop_blank_band(int owx, int owy, uint16_t scroll_x,
-                                   uint16_t scroll_y) {
+/* True when $7F at (bx,by) matches foreign ledge ink near (owx,owy). */
+static int mw_prop_7f_matches_origin(int bx, int by, int owx, int owy) {
+  const uint16_t off = mw_7f_off_from_world((uint16_t)bx, (uint16_t)by);
+  if (!off)
+    return 0;
+  const uint16_t t = mw_read7f16(off);
+  if (mw_bg1_tile_void(t) || t == 0x0200u)
+    return 0;
+  for (int dx = -0x20; dx <= 0x20; dx += 0x10) {
+    const uint16_t po =
+        mw_7f_off_from_world((uint16_t)(owx + dx), (uint16_t)owy);
+    if (po && mw_read7f16(po) == t)
+      return 1;
+  }
+  return 0;
+}
+
+/* Home prop owns this strip column at world Y — do not erase local ledge. */
+static int mw_prop_home_keepout_x(int bx, int by, int local_slot, uint16_t c0x,
+                                  uint16_t c0y, uint16_t c1x, uint16_t c1y) {
+  uint16_t idx = mw_wram16(0x1E14u);
+  for (int guard = 0; guard < 64 && idx; guard++) {
+    const uint16_t next = mw_wram16((uint16_t)(idx + 0x14u));
+    if (mw_obj_is_stage_prop(idx)) {
+      const int home = mw_stage_prop_home_cam(idx, c0x, c0y, c1x, c1y);
+      if (home == local_slot) {
+        const int pwx = (int)mw_wram16((uint16_t)(idx + 2u));
+        const int pwy = (int)mw_wram16((uint16_t)(idx + 4u));
+        const int ady = pwy > by ? pwy - by : by - pwy;
+        const int adx = pwx > bx ? pwx - bx : bx - pwx;
+        if (ady <= 0x30 && adx <= 0x70)
+          return 1;
+      }
+    }
+    if (next == 0 || next == idx)
+      break;
+    idx = next;
+  }
+  return 0;
+}
+
+/* Pocket blank around object origin (origin inside / near 4:3). */
+static unsigned mw_prop_blank_band_pocket(int owx, int owy, uint16_t scroll_x,
+                                          uint16_t scroll_y) {
   static const int kDx[7] = {-0x30, -0x20, -0x10, 0, 0x10, 0x20, 0x30};
   unsigned hit = 0;
   for (int dy = -64; dy <= 0x80; dy += 8) {
     for (int k = 0; k < 7; k++) {
       const uint16_t bx = (uint16_t)(owx + kDx[k]);
       const uint16_t by = (uint16_t)(owy + dy);
-      /* ±3 row slop: trail ghosts just outside the rebuilt strip edge. */
       if (mw_bg1_world_to_vaddr_slop(bx, by, scroll_x, scroll_y, 3) >= 0) {
         mw_bg1_blank_world(bx, by, scroll_x, scroll_y);
         hit++;
@@ -3719,6 +3859,125 @@ static unsigned mw_prop_blank_band(int owx, int owy, uint16_t scroll_x,
     }
   }
   return hit;
+}
+
+/*
+ * Foreign ledge ink in the native 4:3 stripe (cols 0..view), not west gutter.
+ * Object origin is often far off-screen (sx≈−400) while brown still fills the
+ * DMA window — pocket-at-origin never intersects those columns. Blank only
+ * native cols, only where $7F matches the ledge fingerprint, narrow Y.
+ */
+static unsigned mw_prop_blank_native_strip(int owx, int owy, int local_slot,
+                                           uint16_t c0x, uint16_t c0y,
+                                           uint16_t c1x, uint16_t c1y,
+                                           uint16_t scroll_x,
+                                           uint16_t scroll_y) {
+  if (!g_ppu)
+    return 0;
+  const unsigned sh = PPU_bigTiles(g_ppu, 0) ? 4u : 3u;
+  const int tile_px = 1 << (int)sh;
+  const int view_cols = 256 >> (int)sh;
+  const int n_rows = mw_present_strip_rows(0);
+  const int32_t ty =
+      (int32_t)(owy >> sh) - (int32_t)(scroll_y >> sh);
+  if (ty < -1 || ty >= n_rows + 1)
+    return 0;
+  const int32_t tx_o =
+      (int32_t)(owx >> sh) - (int32_t)(scroll_x >> sh);
+  /* Origin already in native 4:3 — pocket path handles it. */
+  if (tx_o >= 0 && tx_o < view_cols)
+    return 0;
+
+  unsigned hit = 0;
+  for (int dy = -0x10; dy <= 0x30; dy += tile_px) {
+    const int by = owy + dy;
+    for (int col = 0; col < view_cols; col++) {
+      const int bx = (int)scroll_x + col * tile_px + tile_px / 2;
+      if (mw_prop_home_keepout_x(bx, by, local_slot, c0x, c0y, c1x, c1y))
+        continue;
+      if (!mw_prop_7f_matches_origin(bx, by, owx, owy))
+        continue;
+      if (mw_bg1_world_to_vaddr_slop((uint16_t)bx, (uint16_t)by, scroll_x,
+                                     scroll_y, 3) < 0)
+        continue;
+      mw_bg1_blank_world((uint16_t)bx, (uint16_t)by, scroll_x, scroll_y);
+      hit++;
+    }
+  }
+  return hit;
+}
+
+static unsigned mw_prop_blank_band(int owx, int owy, int local_slot,
+                                   uint16_t c0x, uint16_t c0y, uint16_t c1x,
+                                   uint16_t c1y, uint16_t scroll_x,
+                                   uint16_t scroll_y) {
+  unsigned hit =
+      mw_prop_blank_native_strip(owx, owy, local_slot, c0x, c0y, c1x, c1y,
+                                 scroll_x, scroll_y);
+  hit += mw_prop_blank_band_pocket(owx, owy, scroll_x, scroll_y);
+  return hit;
+}
+
+/*
+ * During native-col rebuild: suppress foreign ledge ink. Match candidate
+ * map word `tile` (snap or $7F) against the foreign origin's $7F cells, or
+ * $7F at this world cell — west gutter (col < 0) never calls this.
+ */
+static int mw_prop_foreign_ink_tile(int wx, int wy, uint16_t tile,
+                                    int local_slot, uint16_t c0x, uint16_t c0y,
+                                    uint16_t c1x, uint16_t c1y,
+                                    uint16_t scroll_x) {
+  if (!g_ppu || !s_present_h2h_full_frame)
+    return 0;
+  if (mw_bg1_tile_void(tile) || tile == 0x0200u)
+    return 0;
+  if (mw_prop_home_keepout_x(wx, wy, local_slot, c0x, c0y, c1x, c1y))
+    return 0;
+  const unsigned sh = PPU_bigTiles(g_ppu, 0) ? 4u : 3u;
+  const int view_cols = 256 >> (int)sh;
+  uint16_t idx = mw_wram16(0x1E14u);
+  for (int guard = 0; guard < 64 && idx; guard++) {
+    const uint16_t next = mw_wram16((uint16_t)(idx + 0x14u));
+    if (mw_obj_is_stage_prop(idx)) {
+      const int home = mw_stage_prop_home_cam(idx, c0x, c0y, c1x, c1y);
+      if (home != local_slot) {
+        const int owx = (int)mw_wram16((uint16_t)(idx + 2u));
+        const int owy = (int)mw_wram16((uint16_t)(idx + 4u));
+        const int ady = owy > wy ? owy - wy : wy - owy;
+        if (ady <= 0x30) {
+          const int32_t tx_o =
+              (int32_t)(owx >> sh) - (int32_t)(scroll_x >> sh);
+          if (tx_o < 0 || tx_o >= view_cols) {
+            for (int dx = -0x20; dx <= 0x20; dx += 0x10) {
+              const uint16_t po = mw_7f_off_from_world(
+                  (uint16_t)(owx + dx), (uint16_t)owy);
+              if (po && mw_read7f16(po) == tile)
+                return 1;
+            }
+            if (mw_prop_7f_matches_origin(wx, wy, owx, owy))
+              return 1;
+          }
+        }
+      }
+    }
+    if (next == 0 || next == idx)
+      break;
+    idx = next;
+  }
+  return 0;
+}
+
+static uint16_t mw_bg1_under_at_world(int wx, int wy) {
+  for (int up = 32; up <= 80; up += 16) {
+    const uint16_t off =
+        mw_7f_off_from_world((uint16_t)wx, (uint16_t)((int)wy - up));
+    if (!off)
+      continue;
+    const uint16_t t = mw_read7f16(off);
+    if (t != 0 && t != 0x0DAEu)
+      return t;
+  }
+  return 0x0200u;
 }
 
 /*
@@ -3761,9 +4020,11 @@ static void mw_present_align_stage_prop_bg1(int local_slot, uint16_t loc_x,
       /* Unassigned (−1) blanks on both peers until sticky home latches. */
       if (home != local_slot) {
         n_try++;
-        unsigned hit = mw_prop_blank_band(owx, owy, scroll_x, scroll_y);
+        unsigned hit = mw_prop_blank_band(owx, owy, local_slot, c0x, c0y, c1x,
+                                          c1y, scroll_x, scroll_y);
         if (had && (pwx != owx || pwy != owy))
-          hit += mw_prop_blank_band(pwx, pwy, scroll_x, scroll_y);
+          hit += mw_prop_blank_band(pwx, pwy, local_slot, c0x, c0y, c1x, c1y,
+                                    scroll_x, scroll_y);
         if (ts >= 0 && ts < 24) {
           s_coldump_bg_obj[ts] = idx;
           s_coldump_bg_hit[ts] = (uint16_t)(hit > 0xffffu ? 0xffffu : hit);

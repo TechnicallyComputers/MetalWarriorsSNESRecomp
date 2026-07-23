@@ -112,15 +112,15 @@ Coldump: `sn`, `tiles[]`, `draw` (home∧sn∧active), `present.n` / `skip_own`.
 ### 4b. BG1 (brown body)
 
 - Shared `$7F` still carries every mover’s brown; local rebuild shows all of them.
-- After rebuild (+ after margin prefill): pocket-blank foreign movers at live
-  `wx/wy` + trail (`mw_prop_blank_band`, ±X pocket — **not** full-strip).
-- **Src alignment (preferred fix for top-of-screen ghosts):** full-frame present
-  keeps `$42B3(scroll)` and must **not** replace it with dual sticky/live when
-  `y_bg=0` (that was `src=sticky`, peer mover dirt in local top rows). Drop
-  sticky / snap when not `same_column` as the local walk; cap snap col remap.
-- Void cells → sky `$0200` (no stale VRAM keep).
-- Coldump: object `sy == wy - cam_y` is already correct on ghost frames — treat
-  as strip/src phase, not object Y math.
+- Ghosts appear in the **native 4:3 DMA window** (strip cols `0..view`), not the
+  west history gutter — edge/widescreen mods do not apply. Object origin is
+  often far off-screen (`sx≈−400`); pocket-at-`+$02` never hits those columns.
+- **Native-col path:** when foreign origin is outside 4:3 but Y hits the strip,
+  blank/filter cols `0..view` only where `$7F`/tile matches the ledge
+  fingerprint (`mw_prop_blank_native_strip` + paint-time
+  `mw_prop_foreign_ink_tile`). West `col < 0` untouched. Home-prop keepout.
+- Also: pocket blank when origin is in-strip; `$42B3(scroll)` kept on
+  full-frame (no sticky replace); void → sky `$0200`.
 
 ---
 
@@ -202,7 +202,10 @@ after meta). Check `sx`/`sy` in coldump before assuming sticky failure.
 3. Home props at `sy ≳ 224` still `skip_y` OAM (stripe) while BG1 brown remains —
    visual “slab without stripe” on the home peer, not a cross-peer ghost.
 4. Widescreen DMA left pad clamps to 0 (VMADD col 0); left columns use shadow /
-   `$7F` west fill — separate from mover OAM.
+   `$7F`/snap west fill + VRAM west capture after rebuild — separate from
+   mover OAM. H2H prefill ForceTile keys must use raw cam (same as
+   `SetWorld`), not `mw_shadow_world(cam, scroll)`. Snap west reads allow
+   column remap; snap capture merges prior west when dual stomps the stripe.
 5. Items (`$9FE2` etc.) use the shared-item sticky path; despawn sync is
    present-side, not sim desync (netplay stays deterministic).
 
@@ -212,5 +215,5 @@ after meta). Check `sx`/`sy` in coldump before assuming sticky failure.
 
 | Date | Note |
 |------|------|
-| 2026-07-23 | Revert full-strip blank (map regression). Ghost → src alignment: full-frame keep `$42B3(scroll)`, drop cross-column sticky/snap, cap snap d_cols. Sticky `$8000` wipe + Y−512 capture kept. |
+| 2026-07-23 | Left gutter: H2H prefill world keys = raw cam (match `SetWorld`); VRAM west capture after rebuild; snap west merge on dual stomp. Earlier: west snap remap; native 4:3 foreign-ink filter; `$42B3` keep; sticky `$8000` wipe. |
 | 2026-07-22 | Initial doc from coldump deep ID + H2H mover work: whitelist vs items, nearer-mech home, multi-tile sticky, BG1 blank, elev-room catalog (`$C382`/`$C39E`/`$C6A4`). |
