@@ -20,9 +20,10 @@ message(STATUS "Metal Warriors lobby game_version: ${SNESRECOMP_BUILD_VERSION} (
 
 # Cross-platform (macOS/Linux) build for MetalWarriorsSNESRecomp.
 #
-# Prerequisites: a snesrecomp checkout at ./snesrecomp (symlink/clone of the
-# sibling repo), the generated C in src/gen/ (run `bash tools/regen.sh` with a
-# verified metalwarriors.sfc at the repo root), SDL2 (e.g. `apt install libsdl2-dev`).
+# Prerequisites: snesrecomp + recomp-ui git submodules at the repo root
+# (`git submodule update --init --recursive`), the generated C in src/gen/
+# (run `bash tools/regen.sh` with a verified metalwarriors.sfc at the repo
+# root), and SDL2 (e.g. `apt install libsdl2-dev`).
 
 set(CMAKE_C_STANDARD 11)
 

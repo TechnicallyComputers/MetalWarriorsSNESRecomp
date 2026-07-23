@@ -23,15 +23,16 @@ hashing.
 
 ## Source setup
 
-The game needs a snesrecomp checkout (default `./snesrecomp`, clone or symlink)
-and the repo-root `recomp-ui` submodule. Initialize both after cloning:
+The game vendors [snesrecomp](https://github.com/mstan/snesrecomp) (`main`) and
+[recomp-ui](https://github.com/mstan/recomp-ui) (`master`) as repo-root
+submodules. Initialize them (and snesrecomp's nested `lib/recomp-net`) after
+cloning:
 
 ```bash
 git submodule update --init --recursive
-git -C snesrecomp submodule update --init --recursive   # lib/recomp-net
 ```
 
-To build against a feature worktree instead, set `SNESRECOMP_ROOT` explicitly:
+To build against a different snesrecomp checkout, set `SNESRECOMP_ROOT`:
 
 ```bash
 SNESRECOMP_ROOT=/path/to/snesrecomp-worktree \
@@ -132,9 +133,9 @@ normal interactive session.
 - `recomp/` - bank `.cfg` seeds and `funcs.h` (synced by regeneration)
 - `src/` - game glue, runtime integration, configuration, and generated stubs
 - `src/gen/` - recompiler output (local only; gitignored)
-- `recomp-ui/` - Dear ImGui launcher submodule (game-owned pin)
-- `snesrecomp/` - default framework checkout or symlink (includes
-  `lib/recomp-net`); override with `SNESRECOMP_ROOT` when using a worktree
+- `recomp-ui/` - Dear ImGui launcher submodule (`master`)
+- `snesrecomp/` - engine submodule (`main`, includes nested `lib/recomp-net`);
+  override with `SNESRECOMP_ROOT` when using a worktree
 - `tools/regen.sh` and `tools/build-linux.sh` - regeneration and Linux build
 - `docs/H2H_STAGE_PROPS.md` - H2H mover/platform identification & manipulation
   (coldump fields, meta whitelist, OAM sticky + BG1 brown)
