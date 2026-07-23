@@ -135,6 +135,8 @@ normal interactive session.
 - `snesrecomp/` - default framework checkout or symlink; override with
   `SNESRECOMP_ROOT` when using a worktree
 - `tools/regen.sh` and `tools/build-linux.sh` - regeneration and Linux build
+- `docs/H2H_STAGE_PROPS.md` - H2H mover/platform identification & manipulation
+  (coldump fields, meta whitelist, OAM sticky + BG1 brown)
 
 ## Status
 
