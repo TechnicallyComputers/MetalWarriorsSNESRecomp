@@ -436,7 +436,17 @@ static int LauncherNpJoin(void *ctx, const char *lobby_id,
   }
   g_launcher_hosting_lan = 0;
   g_launcher_joined_lan = 0;
-  return snes_lobby_join(lobby_id, password ? password : "", "0.0.0.0:0");
+  {
+    /* Never advertise :0 — the lobby rewrites that to peer_ip:0 and the host's
+     * rnet_session_start_lan rejects port 0, so only the guest boots into
+     * netplay while the host falls back offline. */
+    char guest_bind[64];
+    int port = rnet_udp_find_free_port(/*preferred=*/7778, 32);
+    if (port <= 0)
+      port = 7778;
+    snprintf(guest_bind, sizeof(guest_bind), "0.0.0.0:%d", port);
+    return snes_lobby_join(lobby_id, password ? password : "", guest_bind);
+  }
 }
 
 static int LauncherNpLeave(void *ctx) {
@@ -544,46 +554,55 @@ static int LauncherNpSetReady(void *ctx, int ready) {
   return snes_lobby_set_ready(ready);
 }
 
+static void LauncherArmLanLaunchFromState(const RNetLanLobby *state) {
+  const char *colon;
+  const char *port;
+  if (!state) return;
+  memset(&g_launcher_lan_launch, 0, sizeof(g_launcher_lan_launch));
+  g_launcher_lan_launch.enabled = 1;
+  g_launcher_lan_launch.local_slot =
+      g_launcher_hosting_lan ? state->host_slot : 1 - state->host_slot;
+  g_launcher_lan_launch.input_player = 0;
+  g_launcher_lan_launch.session_id = 1;
+  g_launcher_lan_launch.input_delay = 2;
+  if (g_launcher_hosting_lan) {
+    colon = strrchr(state->endpoint, ':');
+    port = colon ? colon + 1 : "7777";
+    snprintf(g_launcher_lan_launch.bind_hostport,
+             sizeof(g_launcher_lan_launch.bind_hostport), "0.0.0.0:%s", port);
+  } else {
+    snprintf(g_launcher_lan_launch.bind_hostport,
+             sizeof(g_launcher_lan_launch.bind_hostport), "0.0.0.0:0");
+    snprintf(g_launcher_lan_launch.peer_hostport,
+             sizeof(g_launcher_lan_launch.peer_hostport), "%s", state->endpoint);
+  }
+}
+
 static int LauncherNpRequestStart(void *ctx,
                                   const RecompLauncherCSettings *settings) {
   SnesLobbyMatchCaps caps = LauncherNetplayCaps(settings);
   RNetLanLobby state;
   (void)ctx;
-  if (g_launcher_hosting_lan && LauncherUseLanMembers(&state) &&
-      state.joiner_name[0])
-    return rnet_lan_lobby_set_started(LauncherLanLobbyPath(), 1);
+  /* LAN host start is file-backed — never fall through to the WS client. */
+  if (g_launcher_hosting_lan) {
+    if (!LauncherReadLanState(&state) || !state.joiner_name[0]) return -1;
+    if (rnet_lan_lobby_set_started(LauncherLanLobbyPath(), 1) !=
+        RNET_LAN_LOBBY_OK)
+      return -1;
+    state.started = 1;
+    LauncherArmLanLaunchFromState(&state);
+    return 0;
+  }
   return snes_lobby_request_start(&caps);
 }
 
 static int LauncherNpLaunchPending(void *ctx) {
   RNetLanLobby state;
-  const char *colon;
-  const char *port;
   (void)ctx;
   if ((g_launcher_hosting_lan || g_launcher_joined_lan) &&
       !g_launcher_lan_launch.enabled && LauncherReadLanState(&state) &&
-      state.started) {
-    memset(&g_launcher_lan_launch, 0, sizeof(g_launcher_lan_launch));
-    g_launcher_lan_launch.enabled = 1;
-    g_launcher_lan_launch.local_slot = g_launcher_hosting_lan
-                                     ? state.host_slot : 1 - state.host_slot;
-    g_launcher_lan_launch.input_player = 0;
-    g_launcher_lan_launch.session_id = 1;
-    g_launcher_lan_launch.input_delay = 2;
-    if (g_launcher_hosting_lan) {
-      colon = strrchr(state.endpoint, ':');
-      port = colon ? colon + 1 : "7777";
-      snprintf(g_launcher_lan_launch.bind_hostport,
-               sizeof(g_launcher_lan_launch.bind_hostport),
-               "0.0.0.0:%s", port);
-    } else {
-      snprintf(g_launcher_lan_launch.bind_hostport,
-               sizeof(g_launcher_lan_launch.bind_hostport), "0.0.0.0:0");
-      snprintf(g_launcher_lan_launch.peer_hostport,
-               sizeof(g_launcher_lan_launch.peer_hostport), "%s",
-               state.endpoint);
-    }
-  }
+      state.started)
+    LauncherArmLanLaunchFromState(&state);
   return g_launcher_lan_launch.enabled || snes_lobby_launch_pending();
 }
 
@@ -591,6 +610,18 @@ static void LauncherNpClearLaunchPending(void *ctx) {
   (void)ctx;
   memset(&g_launcher_lan_launch, 0, sizeof(g_launcher_lan_launch));
   snes_lobby_clear_launch_pending();
+}
+
+static const char *LauncherNpLastError(void *ctx) {
+  const SnesLobbyJoinInfo *join;
+  (void)ctx;
+  join = snes_lobby_join_info();
+  return (join && join->last_error[0]) ? join->last_error : "";
+}
+
+static void LauncherNpClearLastError(void *ctx) {
+  (void)ctx;
+  snes_lobby_clear_last_error();
 }
 
 static int LauncherNpFillLaunch(void *ctx,
@@ -603,8 +634,14 @@ static int LauncherNpFillLaunch(void *ctx,
     *out = g_launcher_lan_launch;
     return 1;
   }
+  /* Online: only fill after the server's op:launch (launch_pending). Filling
+   * from a seated lobby alone let the host boot before peers received launch. */
+  if (!snes_lobby_launch_pending()) return 0;
   join = snes_lobby_join_info();
-  if (!join || !join->ok) return 0;
+  if (!join || !join->bind_hostport[0]) return 0;
+  /* Guests need a concrete host peer. Host may leave peer empty so transport
+   * learns the guest from the first UDP packet. */
+  if (join->local_slot != 0 && !join->peer_hostport[0]) return 0;
   caps = snes_lobby_match_caps();
   memset(out, 0, sizeof(*out));
   out->enabled = 1;
@@ -650,6 +687,8 @@ static RecompLauncherCNetplayCallbacks g_launcher_netplay_callbacks = {
   LauncherNpFillLaunch,
   LauncherNpLocalAddressGet,
   LauncherNpKickMember,
+  LauncherNpLastError,
+  LauncherNpClearLastError,
 };
 #endif
 
@@ -2111,7 +2150,9 @@ error_reading:;
     /* Soft-return: keep lobby WebSocket; reopen MotK room view. */
     if (g_launcher_hosting_lan || g_launcher_joined_lan)
       (void)rnet_lan_lobby_set_started(LauncherLanLobbyPath(), 0);
-    snes_lobby_set_ready(0);
+    /* Auto-ready: there is no Ready toggle; keep seats launchable on rematch
+     * (including older lobby servers that still gate start on all_ready). */
+    snes_lobby_set_ready(1);
     snes_lobby_clear_launch_pending();
     snes_netplay_clear_return_to_lobby();
     g_netplay_from_lobby = 0;
