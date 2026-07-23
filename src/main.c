@@ -436,17 +436,8 @@ static int LauncherNpJoin(void *ctx, const char *lobby_id,
   }
   g_launcher_hosting_lan = 0;
   g_launcher_joined_lan = 0;
-  {
-    /* Never advertise :0 — the lobby rewrites that to peer_ip:0 and the host's
-     * rnet_session_start_lan rejects port 0, so only the guest boots into
-     * netplay while the host falls back offline. */
-    char guest_bind[64];
-    int port = rnet_udp_find_free_port(/*preferred=*/7778, 32);
-    if (port <= 0)
-      port = 7778;
-    snprintf(guest_bind, sizeof(guest_bind), "0.0.0.0:%d", port);
-    return snes_lobby_join(lobby_id, password ? password : "", guest_bind);
-  }
+  /* Guest UDP bind is normalized in snes_lobby_join (never advertises :0). */
+  return snes_lobby_join(lobby_id, password ? password : "", NULL);
 }
 
 static int LauncherNpLeave(void *ctx) {
@@ -626,7 +617,7 @@ static void LauncherNpClearLastError(void *ctx) {
 
 static int LauncherNpFillLaunch(void *ctx,
                                 RecompLauncherCNetplayLaunch *out) {
-  const SnesLobbyJoinInfo *join;
+  SnesLobbyJoinInfo join;
   const SnesLobbyMatchCaps *caps;
   (void)ctx;
   if (!out) return 0;
@@ -634,25 +625,19 @@ static int LauncherNpFillLaunch(void *ctx,
     *out = g_launcher_lan_launch;
     return 1;
   }
-  /* Online: only fill after the server's op:launch (launch_pending). Filling
-   * from a seated lobby alone let the host boot before peers received launch. */
-  if (!snes_lobby_launch_pending()) return 0;
-  join = snes_lobby_join_info();
-  if (!join || !join->bind_hostport[0]) return 0;
-  /* Guests need a concrete host peer. Host may leave peer empty so transport
-   * learns the guest from the first UDP packet. */
-  if (join->local_slot != 0 && !join->peer_hostport[0]) return 0;
+  /* Online: snes_lobby_try_fill_launch gates on op:launch + usable endpoints. */
+  if (!snes_lobby_try_fill_launch(&join)) return 0;
   caps = snes_lobby_match_caps();
   memset(out, 0, sizeof(*out));
   out->enabled = 1;
-  out->local_slot = join->local_slot;
+  out->local_slot = join.local_slot;
   out->input_player = 0;
-  out->session_id = join->session_id;
+  out->session_id = join.session_id;
   out->input_delay = caps && caps->valid ? caps->input_delay : 2;
   snprintf(out->bind_hostport, sizeof(out->bind_hostport), "%s",
-           join->bind_hostport);
+           join.bind_hostport);
   snprintf(out->peer_hostport, sizeof(out->peer_hostport), "%s",
-           join->peer_hostport);
+           join.peer_hostport);
   return 1;
 }
 
