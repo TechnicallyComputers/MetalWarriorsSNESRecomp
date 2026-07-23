@@ -419,12 +419,13 @@ static int LauncherNpCreate(void *ctx, const char *lobby_name,
 }
 
 static int LauncherNpJoin(void *ctx, const char *lobby_id,
-                          const char *password) {
+                          const char *password, char *guest_bind) {
   RNetLanLobby state;
   const char *name;
   (void)ctx;
   memset(&g_launcher_lan_launch, 0, sizeof(g_launcher_lan_launch));
   if (lobby_id && strncmp(lobby_id, "lan:", 4) == 0) {
+    (void)guest_bind;
     name = snes_lobby_display_name();
     if (rnet_lan_lobby_join(LauncherLanLobbyPath(), "Metal Warriors",
                             SNES_GAME_VERSION, password ? password : "",
@@ -436,8 +437,7 @@ static int LauncherNpJoin(void *ctx, const char *lobby_id,
   }
   g_launcher_hosting_lan = 0;
   g_launcher_joined_lan = 0;
-  /* Guest UDP bind is normalized in snes_lobby_join (never advertises :0). */
-  return snes_lobby_join(lobby_id, password ? password : "", NULL);
+  return snes_lobby_join(lobby_id, password ? password : "", guest_bind);
 }
 
 static int LauncherNpLeave(void *ctx) {
