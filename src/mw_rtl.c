@@ -419,6 +419,36 @@ static int mw_prop_home_lookup(uint16_t obj) {
   return -1;
 }
 
+/*
+ * Mover *body* intersects the local full-frame view (not origin alone).
+ * Origins often sit far left (coldump sx≈−300) while brown/OAM still fill
+ * the left margin / strip — origin-only FOV left those skip_own + blanked.
+ * AABB vs widescreen view; Y slop for tall ledges. Far ghosts with no X
+ * overlap into the local band (sx≲−400 and body_r still left of view)
+ * stay foreign-blanked.
+ */
+static int mw_prop_in_local_fov(int owx, int owy, uint16_t loc_x,
+                                uint16_t loc_y) {
+  const int extra =
+      (g_ws_active && g_ws_extra > 0) ? IntMin(g_ws_extra, kWsExtraMax) : 0;
+  const int sx = owx - (int)loc_x;
+  const int sy = owy - (int)loc_y;
+  /* Pocket / keepout-ish body: origin can be west of the visible ledge. */
+  const int body_l = sx - 48;
+  const int body_r = sx + 256;
+  const int body_t = sy - 64;
+  const int body_b = sy + 128;
+  const int view_l = -extra - 16;
+  const int view_r = 256 + extra + 16;
+  const int view_t = -96;
+  const int view_b = 224 + 112;
+  if (body_r < view_l || body_l > view_r)
+    return 0;
+  if (body_b < view_t || body_t > view_b)
+    return 0;
+  return 1;
+}
+
 static int mw_stage_prop_home_cam(uint16_t obj, uint16_t cam0x, uint16_t cam0y,
                                   uint16_t cam1x, uint16_t cam1y) {
   (void)cam0x;
@@ -3173,10 +3203,15 @@ static void mw_coldump_tick(int local_slot) {
           (s_coldump_bg_obj[ps] == idx) ? (unsigned)s_coldump_bg_hit[ps] : 0u;
       const unsigned bg_try =
           (s_coldump_bg_obj[ps] == idx) ? (unsigned)s_coldump_bg_try[ps] : 0u;
-      /* draw heuristic: home peer with sticky (act bit flickers; not required). */
-      const int draw = (home == slot && sn > 0) ? 1 : 0;
       const int sx = (int)wx - (int)loc_x;
       const int sy = (int)wy - (int)loc_y;
+      /* Home sticky, or foreign-but-in-FOV (same present exception). */
+      const int draw =
+          (sn > 0 &&
+           (home == slot ||
+            mw_prop_in_local_fov((int)wx, (int)wy, loc_x, loc_y)))
+              ? 1
+              : 0;
 
       fprintf(s_coldump_fp,
               "%s{\"o\":%u,\"m\":%u,\"bank\":%u,\"t6\":%u,\"fl\":%u,"
@@ -3819,17 +3854,20 @@ static int mw_prop_7f_matches_origin(int bx, int by, int owx, int owy) {
   return 0;
 }
 
-/* Home prop owns this strip column at world Y — do not erase local ledge. */
+/* Home (or in-FOV) prop owns this strip column at world Y — keep ledge. */
 static int mw_prop_home_keepout_x(int bx, int by, int local_slot, uint16_t c0x,
                                   uint16_t c0y, uint16_t c1x, uint16_t c1y) {
+  const uint16_t loc_x = (local_slot == 0) ? c0x : c1x;
+  const uint16_t loc_y = (local_slot == 0) ? c0y : c1y;
   uint16_t idx = mw_wram16(0x1E14u);
   for (int guard = 0; guard < 64 && idx; guard++) {
     const uint16_t next = mw_wram16((uint16_t)(idx + 0x14u));
     if (mw_obj_is_stage_prop(idx)) {
       const int home = mw_stage_prop_home_cam(idx, c0x, c0y, c1x, c1y);
-      if (home == local_slot) {
-        const int pwx = (int)mw_wram16((uint16_t)(idx + 2u));
-        const int pwy = (int)mw_wram16((uint16_t)(idx + 4u));
+      const int pwx = (int)mw_wram16((uint16_t)(idx + 2u));
+      const int pwy = (int)mw_wram16((uint16_t)(idx + 4u));
+      if (home == local_slot ||
+          mw_prop_in_local_fov(pwx, pwy, loc_x, loc_y)) {
         const int ady = pwy > by ? pwy - by : by - pwy;
         const int adx = pwx > bx ? pwx - bx : bx - pwx;
         if (ady <= 0x30 && adx <= 0x70)
@@ -3933,6 +3971,8 @@ static int mw_prop_foreign_ink_tile(int wx, int wy, uint16_t tile,
     return 0;
   if (mw_prop_home_keepout_x(wx, wy, local_slot, c0x, c0y, c1x, c1y))
     return 0;
+  const uint16_t loc_x = (local_slot == 0) ? c0x : c1x;
+  const uint16_t loc_y = (local_slot == 0) ? c0y : c1y;
   const unsigned sh = PPU_bigTiles(g_ppu, 0) ? 4u : 3u;
   const int view_cols = 256 >> (int)sh;
   uint16_t idx = mw_wram16(0x1E14u);
@@ -3940,9 +3980,10 @@ static int mw_prop_foreign_ink_tile(int wx, int wy, uint16_t tile,
     const uint16_t next = mw_wram16((uint16_t)(idx + 0x14u));
     if (mw_obj_is_stage_prop(idx)) {
       const int home = mw_stage_prop_home_cam(idx, c0x, c0y, c1x, c1y);
-      if (home != local_slot) {
-        const int owx = (int)mw_wram16((uint16_t)(idx + 2u));
-        const int owy = (int)mw_wram16((uint16_t)(idx + 4u));
+      const int owx = (int)mw_wram16((uint16_t)(idx + 2u));
+      const int owy = (int)mw_wram16((uint16_t)(idx + 4u));
+      if (home != local_slot &&
+          !mw_prop_in_local_fov(owx, owy, loc_x, loc_y)) {
         const int ady = owy > wy ? owy - wy : wy - owy;
         if (ady <= 0x30) {
           const int32_t tx_o =
@@ -4017,8 +4058,10 @@ static void mw_present_align_stage_prop_bg1(int local_slot, uint16_t loc_x,
       const int had = s_prop_trail_valid[ts] && s_prop_trail_obj[ts] == idx;
       const int pwx = had ? (int)s_prop_trail_wx[ts] : owx;
       const int pwy = had ? (int)s_prop_trail_wy[ts] : owy;
-      /* Unassigned (−1) blanks on both peers until sticky home latches. */
-      if (home != local_slot) {
+      const int in_fov = mw_prop_in_local_fov(owx, owy, loc_x, loc_y);
+      /* Unassigned (−1) blanks on both peers until sticky home latches.
+       * In-FOV foreign: keep brown (history peer still looking at it). */
+      if (home != local_slot && !in_fov) {
         n_try++;
         unsigned hit = mw_prop_blank_band(owx, owy, local_slot, c0x, c0y, c1x,
                                           c1y, scroll_x, scroll_y);
@@ -5191,8 +5234,8 @@ static int mw_present_oam_from_cam_capture(int local_slot, int extra,
   /* ---- stage props ($00B1≠$D5B8) ----
    * Home-isolated multi-tile sticky. Raw cam capture is often 1 of N under
    * dual OAM pressure — skip raw halves and place the full sticky set from
-   * live +$02/+$04 for the home peer only (same completeness model as
-   * shared $B1 items, but still skip_own for foreign homes). */
+   * live +$02/+$04 for the home peer (and foreign peers still looking at
+   * the platform — in-FOV exception). Off-screen foreign → skip_own. */
   unsigned prop_n = 0, prop_skip_own = 0, prop_skip_y = 0, prop_raw = 0;
   uint8_t prop_alive[kMwPropHomeMax];
   memset(prop_alive, 0, sizeof(prop_alive));
@@ -5210,12 +5253,14 @@ static int mw_present_oam_from_cam_capture(int local_slot, int extra,
         if (s_prop_sticky_valid[ps] && s_prop_sticky_obj[ps] == idx)
           prop_alive[ps] = 1;
         const int home = mw_stage_prop_home_cam(idx, c0x, c0y, c1x, c1y);
-        if (home != local_slot) {
+        const int live_ox = (int)mw_wram16((uint16_t)(idx + 2u));
+        const int live_oy = (int)mw_wram16((uint16_t)(idx + 4u));
+        const int in_fov =
+            mw_prop_in_local_fov(live_ox, live_oy, loc_x, loc_y);
+        if (home != local_slot && !in_fov) {
           prop_skip_own++;
         } else if (s_prop_sticky_valid[ps] && s_prop_sticky_obj[ps] == idx &&
                    s_prop_sticky_n[ps] > 0) {
-          const int live_ox = (int)mw_wram16((uint16_t)(idx + 2u));
-          const int live_oy = (int)mw_wram16((uint16_t)(idx + 4u));
           for (unsigned t = 0; t < s_prop_sticky_n[ps] && kept < 128u; t++) {
             const uint8_t *spr = s_prop_sticky_spr[ps][t];
             const int x =
@@ -5269,12 +5314,13 @@ static int mw_present_oam_from_cam_capture(int local_slot, int extra,
           s_prop_sticky_n[ps] > 0)
         continue; /* already presented full sticky set */
       int home = mw_stage_prop_home_cam(pobj, c0x, c0y, c1x, c1y);
-      if (home != local_slot) {
+      const int live_ox = (int)mw_wram16((uint16_t)(pobj + 2u));
+      const int live_oy = (int)mw_wram16((uint16_t)(pobj + 4u));
+      if (home != local_slot &&
+          !mw_prop_in_local_fov(live_ox, live_oy, loc_x, loc_y)) {
         prop_skip_own++;
         continue;
       }
-      const int live_ox = (int)mw_wram16((uint16_t)(pobj + 2u));
-      const int live_oy = (int)mw_wram16((uint16_t)(pobj + 4u));
       const int mox = (int)s_cam_prop_meta_ox[src][i];
       const int moy = (int)s_cam_prop_meta_oy[src][i];
       const int cap_sy = (int)s_cam_sy[src][i];

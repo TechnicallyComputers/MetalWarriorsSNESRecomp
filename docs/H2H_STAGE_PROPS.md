@@ -46,7 +46,7 @@ Three distinct classes — do **not** conflate:
 
 | Class | Test | Present policy |
 |-------|------|----------------|
-| **Mover / stage prop** | bank `$00B1` **and** meta in whitelist | Home-isolated: OAM sticky + BG1 brown blank for foreign peer |
+| **Mover / stage prop** | bank `$00B1` **and** meta in whitelist | Home-isolated OAM/BG1, with **in-FOV exception** (`mw_prop_in_local_fov`): body AABB vs local widescreen view (origins at `sx≈−300` still count when the ledge reaches the margin). Skip foreign blank / skip_own when that hits; true off-left ghosts stay suppressed |
 | **Shared item** | bank `$00B1`, meta ≠ `$D5B8`, **not** whitelist | Shared world OAM; multi-tile sticky for **both** peers |
 | **Elevator** | meta `$D5B8` | BG2 / other path — **not** stage-prop whitelist |
 
@@ -182,7 +182,8 @@ jq -c '.props[]?|select((.dwx|fabs)+(.dwy|fabs)>0)|{o,m,dwx,dwy,wx,wy}' /tmp/mw_
 | Change home rule | `mw_stage_prop_home_cam` | Tag vs nearer-mech / hysteresis |
 | Capture completeness | `mw_cam_oam_commit` + `mw_prop_sticky_store` | Widen X/Y for props; accumulate tiles |
 | Draw on home peer | `mw_present_oam_from_cam_capture` sticky loop | Full `tiles[]` from live wx/wy |
-| Hide on foreign peer | same + `skip_own`; BG1 `mw_present_align_stage_prop_bg1` | OAM skip + brown blank |
+| Hide on foreign peer | same + `skip_own`; BG1 `mw_present_align_stage_prop_bg1` | OAM skip + brown blank when origin **not** in local FOV (`mw_prop_in_local_fov`) |
+| Keep on-screen foreign | FOV exception in present + blank + ink filter | History peer still looking at a hysteretic foreign home |
 | Shared pickup (not mover) | `mw_is_shared_b1_item_meta` + item sticky | Both peers; do not home-isolate |
 | Elevator | exclude `$D5B8` from mover path | BG2 / ROM strip |
 
@@ -215,5 +216,5 @@ after meta). Check `sx`/`sy` in coldump before assuming sticky failure.
 
 | Date | Note |
 |------|------|
-| 2026-07-23 | Left gutter: H2H prefill world keys = raw cam (match `SetWorld`); VRAM west capture after rebuild; snap west merge on dual stomp. Earlier: west snap remap; native 4:3 foreign-ink filter; `$42B3` keep; sticky `$8000` wipe. |
+| 2026-07-23 | FOV exception uses body AABB (not origin alone) so `sx≈−300` ledges in the left margin stay visible. Confirm prod ELF is what you launch (`build-linux-prod/…`, not `build/` / debug). Earlier: origin FOV; left-gutter keys; native foreign-ink filter; sticky `$8000` wipe. |
 | 2026-07-22 | Initial doc from coldump deep ID + H2H mover work: whitelist vs items, nearer-mech home, multi-tile sticky, BG1 blank, elev-room catalog (`$C382`/`$C39E`/`$C6A4`). |

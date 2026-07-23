@@ -1033,24 +1033,12 @@ int main(int argc, char** argv) {
             fclose(rc);
           }
           if (net.enabled) {
-            snes_netplay_config_defaults(&g_netplay_cfg);
-            g_netplay_cfg.enabled = 1;
-            g_netplay_cfg.local_slot = net.local_slot;
-            g_netplay_cfg.input_player =
-                (net.input_player == 0 || net.input_player == 1)
-                    ? net.input_player : -1;
-            g_netplay_cfg.session_id = net.session_id ? net.session_id : 1u;
-            g_netplay_cfg.transport = 0;
-            snprintf(g_netplay_cfg.bind_hostport, sizeof(g_netplay_cfg.bind_hostport),
-                     "%s", net.bind_hostport);
-            snprintf(g_netplay_cfg.peer_hostport, sizeof(g_netplay_cfg.peer_hostport),
-                     "%s", net.peer_hostport);
-            snes_netplay_apply_env(&g_netplay_cfg);
-            /* Host match_caps win over local SNES_NET_INPUT_DELAY. */
-            if (net.input_delay >= 0 && net.input_delay <= 16)
-              g_netplay_cfg.input_delay = net.input_delay;
+            SnesHostLaunchResult launch;
+            snes_host_app_apply_launch(&net, &launch);
+            g_netplay_cfg = launch.net_cfg;
             /* MW: always lock peers to 71 — never local 95 / unset fallback. */
-            g_netplay_caps_ws_extra = 71;
+            g_netplay_caps_ws_extra =
+                launch.caps_ws_extra >= 0 ? launch.caps_ws_extra : 71;
             g_netplay_pending = 1;
             g_netplay_from_lobby = 1;
             host_report_breadcrumb(
@@ -1710,24 +1698,12 @@ error_reading:;
     if (lr == 0) {
       ConfigFromLauncherSettings(&ls);
       if (net.enabled) {
+        SnesHostLaunchResult lr;
         g_config.widescreen = 71;
         WriteConfigFile(config_file);
-        snes_netplay_config_defaults(&g_netplay_cfg);
-        g_netplay_cfg.enabled = 1;
-        g_netplay_cfg.local_slot = net.local_slot;
-        g_netplay_cfg.input_player =
-            (net.input_player == 0 || net.input_player == 1)
-                ? net.input_player : -1;
-        g_netplay_cfg.session_id = net.session_id ? net.session_id : 1u;
-        g_netplay_cfg.transport = 0;
-        snprintf(g_netplay_cfg.bind_hostport, sizeof(g_netplay_cfg.bind_hostport),
-                 "%s", net.bind_hostport);
-        snprintf(g_netplay_cfg.peer_hostport, sizeof(g_netplay_cfg.peer_hostport),
-                 "%s", net.peer_hostport);
-        snes_netplay_apply_env(&g_netplay_cfg);
-        if (net.input_delay >= 0 && net.input_delay <= 16)
-          g_netplay_cfg.input_delay = net.input_delay;
-        g_netplay_caps_ws_extra = 71;
+        snes_host_app_apply_launch(&net, &lr);
+        g_netplay_cfg = lr.net_cfg;
+        g_netplay_caps_ws_extra = lr.caps_ws_extra >= 0 ? lr.caps_ws_extra : 71;
         g_netplay_pending = 1;
         g_netplay_from_lobby = 1;
         host_report_breadcrumb(
@@ -2031,18 +2007,8 @@ static void MwNetplayPollEvents(void *ctx, int *want_soft_exit) {
 static void MwNetplayOnConnectTimeout(void *ctx) {
   const char *suppress_dialog = getenv("SNES_NET_SUPPRESS_ERROR_DIALOG");
   const int is_ice = strcmp(snes_netplay_transport_name(), "ice") == 0;
-  const char *error_code =
-      is_ice ? "connect_timeout_ice" : "connect_timeout_lan";
-  const char *message =
-      is_ice
-          ? "Could not establish an online connection to the other "
-            "player within 30 seconds.\n\nAllow the game through the "
-            "Windows firewall, make sure both players are still in the "
-            "lobby, then rejoin and retry."
-          : "Could not establish a direct connection to the other "
-            "player within 30 seconds.\n\nCheck the lobby address, "
-            "firewall, and that both players are still connected, then "
-            "rejoin and retry.";
+  const char *error_code = snes_host_connect_timeout_error_code(is_ice);
+  const char *message = snes_host_connect_timeout_message(is_ice);
   (void)ctx;
   snes_host_lobby_set_runtime_error(error_code);
   fprintf(stderr, "snes_netplay: %s: %s\n", error_code, message);
