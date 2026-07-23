@@ -1744,6 +1744,17 @@ session_reboot:
     g_renderer_funcs = kSdlRendererFuncs;
   }
 
+  /* ROM is loaded once above session_reboot; rematch must keep or reload it.
+   * Offline soft-return used to free(kRom) then jump here → SnesInit(NULL). */
+  if (!kRom && argv[0]) {
+    size_t size = 0;
+    kRom = ReadWholeFile(argv[0], &size);
+    kRom_SIZE = (uint32)size;
+    host_report_breadcrumb("rom reloaded: %u bytes", kRom_SIZE);
+    if (!kRom)
+      goto error_reading;
+  }
+
   Snes *snes = SnesInit(kRom, kRom_SIZE);
   host_report_breadcrumb("SnesInit: %s", snes ? "ok" : "FAILED");
   if (snes == NULL) {
@@ -2231,7 +2242,9 @@ error_reading:;
         goto session_reboot;
       }
 
-      /* Offline Play after soft-return — leave lobby and cold-boot solo. */
+      /* Offline Play after soft-return — leave lobby and cold-boot solo.
+       * Keep the ROM buffer (loaded above session_reboot); freeing it here
+       * made SnesInit(NULL) SIGSEGV on rematch. */
       g_config.widescreen = 0;
       WriteConfigFile(config_file);
       g_netplay_cfg.enabled = 0;
@@ -2240,8 +2253,6 @@ error_reading:;
       if (g_launcher_hosting_lan || g_launcher_joined_lan)
         (void)LauncherNpLeave(NULL);
       snes_lobby_disconnect();
-      free(kRom);
-      kRom = NULL;
       host_report_breadcrumb("launcher: offline launch after lobby");
       goto session_reboot;
     }
