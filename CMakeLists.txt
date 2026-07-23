@@ -119,6 +119,6 @@ endif()
 include(${CMAKE_SOURCE_DIR}/recomp-ui/recomp_ui.cmake)
 recomp_target_launcher_ui(MetalWarriorsSNESRecomp)
 
-# Delay-sync netplay (LAN by default; opt into ICE with
+# Delay-sync netplay + MotK lobby client (LAN by default; opt into ICE with
 # -DSNESRECOMP_NET_ICE=ON when libjuice is available).
 snesrecomp_enable_recomp_net(MetalWarriorsSNESRecomp)

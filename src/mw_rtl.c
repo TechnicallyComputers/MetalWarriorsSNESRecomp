@@ -253,9 +253,25 @@ static bool s_nmi_latched;
 static uint16_t s_sticky_src_bg1, s_sticky_src_bg2;
 static int s_sticky_src_bg1_frame = -2;
 static int s_sticky_src_bg2_frame = -2;
+/* Dual H2H: per-camera BG1 stripe bases (DMA only streams one cam/frame).
+ * Full-frame present must not reuse the other cam's sticky via Y-adjust. */
+static uint16_t s_sticky_src_bg1_slot[2];
+static int s_sticky_src_bg1_slot_frame[2] = {-2, -2};
+/* Per-cam $7F strip snapshot for full-frame local rebuild / margins. */
+enum { kMwBg1SnapRows = 32, kMwBg1SnapCols = 32 };
+typedef struct {
+  uint16_t src;
+  uint16_t pitch;
+  uint16_t cam_x, cam_y;
+  int frame;
+  uint8_t valid;
+  uint16_t words[kMwBg1SnapRows][kMwBg1SnapCols];
+} MwBg1Snap;
+static MwBg1Snap s_bg1_snap[2];
 /* Set while MwDrawPpuFrameLocalFull is presenting — idle BG2 must not use
  * 1P west-ROM / history extend (fills space with repeating tile trash). */
 static int s_present_h2h_full_frame;
+static int s_present_h2h_local_slot = -1;
 /* Room uses decorative BG2 from ROM (bank $BB etc.), not $7F map stream.
  * Set by MwNotifyBg2MapDma; sticky/$1E38 blips from terrain dirty frames
  * must not flip present into a $7F BG2 rebuild. Cleared on map-base change
@@ -278,6 +294,118 @@ static uint16_t mw_map_src_from_42b3(uint16_t cam_x, uint16_t cam_y) {
   if (!base)
     return 0;
   return (uint16_t)(base + col_i);
+}
+
+static uint16_t mw_bg1_pitch(void) {
+  uint16_t pitch = mw_wram16(0x00B6);
+  if (pitch < 32)
+    pitch = 0x0290;
+  return pitch;
+}
+
+/* True when two $7F stripe bases share a column (differ by whole pitch rows). */
+static int mw_bg1_src_same_column(uint16_t a, uint16_t b, uint16_t pitch) {
+  if (!a || !b || pitch < 32)
+    return 0;
+  const int d = (int)a - (int)b;
+  return (d % (int)pitch) == 0;
+}
+
+/* Snapshot one cam's BG1 strip out of $7F (survives dual VRAM stomps). */
+static void mw_bg1_snap_capture(int slot, uint16_t cam_x, uint16_t cam_y,
+                                uint16_t src_opt) {
+  if (slot != 0 && slot != 1)
+    return;
+  const uint16_t pitch = mw_bg1_pitch();
+  uint16_t src = src_opt;
+  if (!src)
+    src = mw_map_src_from_42b3(cam_x, cam_y);
+  if (!src)
+    return;
+  MwBg1Snap *snap = &s_bg1_snap[slot];
+  snap->src = src;
+  snap->pitch = pitch;
+  snap->cam_x = cam_x;
+  snap->cam_y = cam_y;
+  {
+    extern int snes_frame_counter;
+    snap->frame = snes_frame_counter;
+  }
+  for (int row = 0; row < kMwBg1SnapRows; row++) {
+    for (int col = 0; col < kMwBg1SnapCols; col++) {
+      const uint32_t off = (uint32_t)src + (uint32_t)row * (uint32_t)pitch +
+                           (uint32_t)col * 2u;
+      snap->words[row][col] =
+          (off + 1u < 0x10000u) ? mw_read7f16((uint16_t)off) : 0;
+    }
+  }
+  snap->valid = 1;
+}
+
+static void mw_bg1_snap_both_cams(void) {
+  if (!MwIsDualViewport())
+    return;
+  const uint16_t c0x = s_nmi_latched ? s_nmi_cam_x : mw_wram16(0x1E16);
+  const uint16_t c0y = s_nmi_latched ? s_nmi_cam_y : mw_wram16(0x1E18);
+  const uint16_t c1x = s_nmi_latched ? s_nmi_cam2_x : mw_wram16(0x1E1A);
+  const uint16_t c1y = s_nmi_latched ? s_nmi_cam2_y : mw_wram16(0x1E1C);
+  mw_bg1_snap_capture(0, c0x, c0y, 0);
+  mw_bg1_snap_capture(1, c1x, c1y, 0);
+}
+
+/* Attribute a BG1 DMA A-bus base to the nearer dual cam and refresh that
+ * slot's sticky + $7F snapshot. */
+static void mw_bg1_note_dma_src(uint16_t src) {
+  if (!src)
+    return;
+  extern int snes_frame_counter;
+  s_sticky_src_bg1 = src;
+  s_sticky_src_bg1_frame = snes_frame_counter;
+
+  int slot = 0;
+  uint16_t cam_x = s_nmi_latched ? s_nmi_cam_x : mw_wram16(0x1E16);
+  uint16_t cam_y = s_nmi_latched ? s_nmi_cam_y : mw_wram16(0x1E18);
+  if (MwIsDualViewport()) {
+    const uint16_t c0x = cam_x;
+    const uint16_t c0y = cam_y;
+    const uint16_t c1x = s_nmi_latched ? s_nmi_cam2_x : mw_wram16(0x1E1A);
+    const uint16_t c1y = s_nmi_latched ? s_nmi_cam2_y : mw_wram16(0x1E1C);
+    const uint16_t s0 = mw_map_src_from_42b3(c0x, c0y);
+    const uint16_t s1 = mw_map_src_from_42b3(c1x, c1y);
+    const int d0 = s0 ? abs((int)src - (int)s0) : 0x7fffffff;
+    const int d1 = s1 ? abs((int)src - (int)s1) : 0x7fffffff;
+    if (d1 < d0) {
+      slot = 1;
+      cam_x = c1x;
+      cam_y = c1y;
+    }
+  }
+  s_sticky_src_bg1_slot[slot] = src;
+  s_sticky_src_bg1_slot_frame[slot] = snes_frame_counter;
+  mw_bg1_snap_capture(slot, cam_x, cam_y, src);
+}
+
+/* Returns 1 and writes *out when the per-cam snap covers (src,row,col). */
+static int mw_bg1_snap_try(int slot, uint16_t src, uint16_t pitch, int row,
+                           int col, uint16_t *out) {
+  if (!out || (slot != 0 && slot != 1))
+    return 0;
+  const MwBg1Snap *snap = &s_bg1_snap[slot];
+  if (!snap->valid || row < 0 || row >= kMwBg1SnapRows || col < 0 ||
+      col >= kMwBg1SnapCols)
+    return 0;
+  /* Accept snap when it covers this stripe column (same X window). */
+  if (snap->src != src &&
+      !mw_bg1_src_same_column(snap->src, src, pitch ? pitch : snap->pitch))
+    return 0;
+  const uint16_t use_pitch = pitch ? pitch : snap->pitch;
+  const int d_rows =
+      use_pitch ? (((int)src - (int)snap->src) / (int)use_pitch) : 0;
+  const int rr = row + d_rows;
+  if (rr < 0 || rr >= kMwBg1SnapRows)
+    return 0;
+  *out = snap->words[rr][col];
+  return 1;
 }
 
 /* Score a $7F stripe base against live BG1 VRAM column 0 (first 12 rows). */
@@ -438,6 +566,9 @@ static void mw_latch_nmi_camera(void) {
   s_nmi_wram_h1_p2 = mw_wram16(0x1E46);
   s_nmi_wram_v1_p2 = mw_wram16(0x1E64);
   s_nmi_latched = true;
+  /* Dual: snapshot each cam's $7F strip so full-frame present can rebuild
+   * P2 from its own window even when the game only DMA'd P1 this frame. */
+  mw_bg1_snap_both_cams();
   {
     static unsigned logs;
     const char *e = getenv("SNESRECOMP_MW_SRC");
@@ -1856,8 +1987,23 @@ static void mw_prefill_margins_from_map_ex(const uint16_t *cam_x_override,
   const uint16_t src2w =
       bg2_stream ? mw_map_src_from_42b3((uint16_t)world2_x, (uint16_t)world2_y)
                  : 0;
-  const uint16_t use_src1 =
-      mw_best_bg1_src(src1w, s_sticky_src_bg1, src1_live, hs0, vs0);
+  /* Full-frame local: never let the other cam's DMA sticky win over $42B3
+   * for this camera — that painted P1 walls into P2's gutters. */
+  uint16_t use_src1;
+  if (single_cam) {
+    const int slot = (s_present_h2h_local_slot == 0 ||
+                      s_present_h2h_local_slot == 1)
+                         ? s_present_h2h_local_slot
+                         : 0;
+    const uint16_t slot_sticky = s_sticky_src_bg1_slot[slot];
+    use_src1 = src1w ? src1w
+                     : (slot_sticky ? slot_sticky
+                                    : mw_best_bg1_src(0, s_sticky_src_bg1,
+                                                      src1_live, hs0, vs0));
+  } else {
+    use_src1 =
+        mw_best_bg1_src(src1w, s_sticky_src_bg1, src1_live, hs0, vs0);
+  }
   const uint16_t use_src2 =
       bg2_stream ? (src2w ? src2w : (s_sticky_src_bg2 ? s_sticky_src_bg2
                                                      : src2_live))
@@ -1975,8 +2121,7 @@ static void mw_dma_size_hook(CpuState *cpu, uint32_t pc24) {
     if (src) {
       extern int snes_frame_counter;
       if (pc24 == kMwDmaSizePcBg1 || pc24 == kMwDmaSizePcAlt1) {
-        s_sticky_src_bg1 = src;
-        s_sticky_src_bg1_frame = snes_frame_counter;
+        mw_bg1_note_dma_src(src);
       } else if (pc24 == kMwDmaSizePcBg2 || pc24 == kMwDmaSizePcAlt2) {
         if (bank == 0x7Fu) {
           s_sticky_src_bg2 = src;
@@ -2463,24 +2608,33 @@ static void mw_present_rebuild_layer_strip(int layer, uint16_t cam_x,
   if (!g_ppu || n_rows <= 0)
     return;
 
-  uint16_t pitch = mw_wram16(0x00B6);
-  if (pitch < 32)
-    pitch = 0x0290;
+  const uint16_t pitch = mw_bg1_pitch();
 
   /* Prefer scroll (= cam on the full-frame path) so src cells == PPU sample. */
   uint16_t src_w = mw_map_src_from_42b3(scroll_x, scroll_y);
   if (!src_w)
     src_w = mw_map_src_from_42b3(cam_x, cam_y);
-  const uint16_t sticky =
-      (layer == 0) ? s_sticky_src_bg1 : s_sticky_src_bg2;
+
+  const int local_slot = s_present_h2h_local_slot;
+  uint16_t sticky = (layer == 0) ? s_sticky_src_bg1 : s_sticky_src_bg2;
+  if (layer == 0 && (local_slot == 0 || local_slot == 1) &&
+      s_sticky_src_bg1_slot[local_slot])
+    sticky = s_sticky_src_bg1_slot[local_slot];
   const uint16_t live = (layer == 0)
                             ? (s_nmi_latched ? s_nmi_src_bg1 : mw_wram16(0x1E36))
                             : (s_nmi_latched ? s_nmi_src_bg2 : mw_wram16(0x1E38));
   uint16_t src = src_w ? src_w : (sticky ? sticky : live);
 
+  /* Live/sticky Y-adjust keeps the DMA stripe's *column*. On full-frame H2H
+   * P2 that column is often still P1's stream — overwriting local $42B3
+   * painted P1 walls into P2's camera. Only apply when the bases share a
+   * column (whole-pitch row drift), or when there is no world src. */
   if (layer == 0 && raw_cam_y != 0) {
     const uint16_t live_src = sticky ? sticky : live;
-    if (live_src) {
+    const int allow_live =
+        live_src &&
+        (!src_w || mw_bg1_src_same_column(src_w, live_src, pitch));
+    if (allow_live) {
       const unsigned sh = PPU_bigTiles(g_ppu, 0) ? 4u : 3u;
       const int tile_px = 1 << (int)sh;
       const int dy = (int)raw_cam_y - (int)scroll_y; /* usually y_bg */
@@ -2509,6 +2663,10 @@ static void mw_present_rebuild_layer_strip(int layer, uint16_t cam_x,
   if (n_rows > 32)
     n_rows = 32;
 
+  const int use_snap =
+      (layer == 0 && (local_slot == 0 || local_slot == 1) &&
+       s_bg1_snap[local_slot].valid);
+
   for (int row = 0; row < n_rows; row++) {
     const int map_row = (int)((buf_ty0 + (uint32_t)row) & 31u);
     for (int col = 0; col < words; col++) {
@@ -2518,11 +2676,16 @@ static void mw_present_rebuild_layer_strip(int layer, uint16_t cam_x,
       const uint16_t vaddr =
           (uint16_t)(map_base + half + (map_row << 5) + (map_col & 31));
       mw_vram_save_word(vaddr);
-      const uint32_t off = (uint32_t)src + (uint32_t)row * (uint32_t)pitch +
-                           (uint32_t)col * 2u;
       uint16_t t = 0;
-      if (off + 1u < 0x10000u)
-        t = mw_read7f16((uint16_t)off);
+      int have = 0;
+      if (use_snap)
+        have = mw_bg1_snap_try(local_slot, src, pitch, row, col, &t);
+      if (!have) {
+        const uint32_t off = (uint32_t)src + (uint32_t)row * (uint32_t)pitch +
+                             (uint32_t)col * 2u;
+        if (off + 1u < 0x10000u)
+          t = mw_read7f16((uint16_t)off);
+      }
       g_ppu->vram[vaddr & 0x7fffu] = t;
     }
   }
@@ -4539,6 +4702,11 @@ void MwDrawPpuFrameLocalFull(int local_slot) {
    * H2H — dual dirty frames false-arm $1E38 / $7F and flash space garbage.
    * Narrow idle BG2 uses the 1P cam-track + retainHistory path (elevators). */
   s_present_h2h_full_frame = 1;
+  s_present_h2h_local_slot = local_slot;
+  /* Refresh local snap from $7F at the present camera (Y-shifted scroll) so
+   * rebuild/margins see this slot's window, not a stale other-cam DMA. */
+  mw_bg1_snap_capture(local_slot, cam_x, cam_y,
+                      mw_map_src_from_42b3(cam_x, cam_y));
   const int bg2_stream = 0;
   const uint16_t h0 = cam_x;
   const uint16_t v0 = cam_y;
@@ -4681,6 +4849,7 @@ void MwDrawPpuFrameLocalFull(int local_slot) {
   memcpy(g_ppu->highOam, high_oam_backup, sizeof(high_oam_backup));
   mw_vram_restore();
   s_present_h2h_full_frame = 0;
+  s_present_h2h_local_slot = -1;
 }
 
 /* LLE host execution cursor — not in snes_saveload (that blob holds the
@@ -4706,7 +4875,11 @@ void MwSessionReset(void) {
   s_nmi_hscroll1 = s_nmi_vscroll1 = 0;
   s_sticky_src_bg1 = s_sticky_src_bg2 = 0;
   s_sticky_src_bg1_frame = s_sticky_src_bg2_frame = -2;
+  s_sticky_src_bg1_slot[0] = s_sticky_src_bg1_slot[1] = 0;
+  s_sticky_src_bg1_slot_frame[0] = s_sticky_src_bg1_slot_frame[1] = -2;
+  memset(s_bg1_snap, 0, sizeof(s_bg1_snap));
   s_present_h2h_full_frame = 0;
+  s_present_h2h_local_slot = -1;
   s_shadow_world_x = s_shadow_world_y = 0;
   s_shadow_world_valid = false;
   memset(s_oam_right_hints, 0, sizeof(s_oam_right_hints));
