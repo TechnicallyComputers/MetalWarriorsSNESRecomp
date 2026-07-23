@@ -52,9 +52,9 @@ enum { kMwMasterClocksPerFrame = 1364u * 262u };
  *
  * A/B (g_ws_extra=71 → pad=5): MW's stripe always uses VMADD col 0, so
  * pad_left clamps to 0 and DASIZ becomes 0x22+2*pad (=#$002C). Right margin
- * from DMA-pad VRAM; left from $7F west of src. Shadow is rebuilt each
- * present (stale history misaligned tile stripes). SNESRECOMP_MW_DMA_WIDEN=0
- * disables widen (A/B only — blanks gutters / despawns BG1 walls).
+ * from DMA-pad VRAM; left from $7F/snap west of src — present rebuild paints
+ * VRAM columns [-pad, …) and shadow prefill ForceTiles the gutter (snap
+ * fallback when dual stomps $7F). SNESRECOMP_MW_DMA_WIDEN=0 disables widen.
  */
 /* Stage "dirty rect" $1E72–$1E78 is NOT a $7F decode window. ROM only
  * CMP/STA's it at $80941E–$809452; the early-out path is dead (both
@@ -705,7 +705,10 @@ static int s_present_h2h_local_slot = -1;
  * frame; full-frame present rebuilds both peers from these caches so the
  * non-streamed cam does not repaint empty/void $7F into its viewport.
  */
-enum { kMwBg1SnapRows = 32, kMwBg1SnapCols = 32 };
+/* Snap stores west+east around the stripe base. DMA pad_left is always 0
+ * (VMADD col 0), so the left widescreen gutter must come from snap/$7F west
+ * of src — not from the 17-word DMA window alone. */
+enum { kMwBg1SnapWest = 8, kMwBg1SnapRows = 32, kMwBg1SnapCols = 40 };
 typedef struct MwBg1Snap {
   uint16_t words[kMwBg1SnapRows][kMwBg1SnapCols];
   uint16_t src;
@@ -765,7 +768,8 @@ static int mw_bg1_tile_weak(uint16_t t) {
   return mw_bg1_tile_void(t) || t == 0x0200u;
 }
 
-/* Snapshot one cam's BG1 strip out of $7F (survives dual VRAM stomps). */
+/* Snapshot one cam's BG1 strip out of $7F (survives dual VRAM stomps).
+ * Columns are relative to src: [-kMwBg1SnapWest, +span). */
 static void mw_bg1_snap_capture(int slot, uint16_t cam_x, uint16_t cam_y,
                                 uint16_t src_opt) {
   uint16_t words[kMwBg1SnapRows][kMwBg1SnapCols];
@@ -778,13 +782,17 @@ static void mw_bg1_snap_capture(int slot, uint16_t cam_x, uint16_t cam_y,
     src = mw_map_src_from_42b3(cam_x, cam_y);
   if (!src)
     return;
+  const int col_lo = -kMwBg1SnapWest;
+  const int col_hi = kMwBg1SnapCols - kMwBg1SnapWest;
+  memset(words, 0, sizeof(words));
   for (int row = 0; row < kMwBg1SnapRows; row++) {
-    for (int col = 0; col < kMwBg1SnapCols; col++) {
-      const uint32_t off = (uint32_t)src + (uint32_t)row * (uint32_t)pitch +
-                           (uint32_t)col * 2u;
-      const uint16_t t =
-          (off + 1u < 0x10000u) ? mw_read7f16((uint16_t)off) : 0;
-      words[row][col] = t;
+    for (int col = col_lo; col < col_hi; col++) {
+      const int byte_off =
+          (int)src + row * (int)pitch + col * 2;
+      uint16_t t = 0;
+      if (byte_off >= 0 && byte_off + 1 < 0x10000)
+        t = mw_read7f16((uint16_t)byte_off);
+      words[row][col + kMwBg1SnapWest] = t;
       if (!mw_bg1_tile_weak(t))
         solid++;
     }
@@ -853,23 +861,30 @@ static void mw_bg1_note_dma_src(uint16_t src) {
   mw_bg1_snap_capture(slot, cam_x, cam_y, src);
 }
 
+/* `col` is relative to `src` (may be negative for west gutter). Maps through
+ * snap->src allowing both row and column deltas — DMA sticky often sits a
+ * few tile-columns east of the present $42B3 base. */
 static uint16_t mw_bg1_snap_word(int slot, uint16_t src, uint16_t pitch,
                                  int row, int col) {
   if (slot != 0 && slot != 1)
     return 0;
   const MwBg1Snap *snap = &s_bg1_snap[slot];
-  if (!snap->valid || row < 0 || row >= kMwBg1SnapRows || col < 0 ||
-      col >= kMwBg1SnapCols)
+  if (!snap->valid || row < 0 || row >= kMwBg1SnapRows)
     return 0;
-  if (snap->src != src &&
-      !mw_bg1_src_same_column(snap->src, src, pitch ? pitch : snap->pitch))
+  int p = pitch ? (int)pitch : (int)snap->pitch;
+  if (p < 32)
+    p = 0x290;
+  const int delta = (int)src - (int)snap->src;
+  const int d_rows = delta / p;
+  const int rem = delta - d_rows * p;
+  if (rem & 1)
     return 0;
-  const int d_rows =
-      pitch ? (((int)src - (int)snap->src) / (int)pitch) : 0;
+  const int d_cols = rem / 2;
   const int rr = row + d_rows;
-  if (rr < 0 || rr >= kMwBg1SnapRows)
+  const int cc = col + d_cols + kMwBg1SnapWest;
+  if (rr < 0 || rr >= kMwBg1SnapRows || cc < 0 || cc >= kMwBg1SnapCols)
     return 0;
-  return snap->words[rr][col];
+  return snap->words[rr][cc];
 }
 
 /* Score a $7F stripe base against live BG1 VRAM column 0 (first 12 rows). */
@@ -2103,8 +2118,18 @@ static void mw_prefill_layer_from_map(int layer, uint16_t src0, uint32_t cam_x,
           const uint32_t left_bytes = (uint32_t)d * 2u;
           if (row_ptr < left_bytes)
             continue;
-          const uint16_t t =
+          uint16_t t =
               mw_read7f16((uint16_t)(row_ptr - left_bytes));
+          /* Dual often stomps $7F; fall back to the per-cam snap west. */
+          if ((t == 0 || t == 0x0DAEu) && layer == 0 &&
+              (s_present_h2h_local_slot == 0 ||
+               s_present_h2h_local_slot == 1)) {
+            const uint16_t st =
+                mw_bg1_snap_word(s_present_h2h_local_slot, src0, pitch, row,
+                                 widx);
+            if (st != 0 && st != 0x0DAEu)
+              t = st;
+          }
           /* $0DAE is MW's decoded-map void (fine-scroll overhang / empty).
            * Painting it into the gutter drew a false lattice over the left
            * margin; skip so the shadow miss (transparent) shows through. */
@@ -3498,12 +3523,16 @@ static void mw_present_rebuild_layer_strip(int layer, uint16_t cam_x,
   int pad = (g_ws_active && g_ws_extra > 0) ? mw_ws_tile_pad() : 0;
   if (pad < 0)
     pad = 0;
-  /* Native stripe = view + 1 overhang; widen adds pad_right (VMADD col 0). */
-  int words = view_cols + 1 + pad;
-  if (words > 32)
-    words = 32;
+  /* Native stripe = view + 1 overhang; DMA widen only adds pad_right
+   * (VMADD col 0 → pad_left=0). Paint [-pad, view+1+pad) so the left
+   * widescreen gutter lands in VRAM / is available to the shadow. */
+  const int col_lo = -pad;
+  int col_hi = view_cols + 1 + pad;
+  if (col_hi > 32)
+    col_hi = 32;
   if (n_rows > 32)
     n_rows = 32;
+  const int map_period = x_mask + 1;
 
   const int use_snap =
       (layer == 0 && (local_slot == 0 || local_slot == 1) &&
@@ -3511,9 +3540,10 @@ static void mw_present_rebuild_layer_strip(int layer, uint16_t cam_x,
 
   for (int row = 0; row < n_rows; row++) {
     const int map_row = (int)((buf_ty0 + (uint32_t)row) & 31u);
-    for (int col = 0; col < words; col++) {
-      const int map_col =
-          (int)((buf_tx0 + (uint32_t)col) & (uint32_t)x_mask);
+    for (int col = col_lo; col < col_hi; col++) {
+      int map_col = ((int)buf_tx0 + col) % map_period;
+      if (map_col < 0)
+        map_col += map_period;
       const int half = (x_mask > 31 && map_col >= 32) ? 0x400 : 0;
       const uint16_t vaddr =
           (uint16_t)(map_base + half + (map_row << 5) + (map_col & 31));
@@ -3522,15 +3552,17 @@ static void mw_present_rebuild_layer_strip(int layer, uint16_t cam_x,
       if (use_snap)
         t = mw_bg1_snap_word(local_slot, src, pitch, row, col);
       if (mw_bg1_tile_void(t)) {
-        const uint32_t off = (uint32_t)src + (uint32_t)row * (uint32_t)pitch +
-                             (uint32_t)col * 2u;
+        const int byte_off =
+            (int)src + row * (int)pitch + col * 2;
         uint16_t live_t = 0;
-        if (off + 1u < 0x10000u)
-          live_t = mw_read7f16((uint16_t)off);
+        if (byte_off >= 0 && byte_off + 1 < 0x10000)
+          live_t = mw_read7f16((uint16_t)byte_off);
         if (!mw_bg1_tile_void(live_t))
           t = live_t;
-        else if (s_present_h2h_full_frame && use_snap)
-          continue; /* keep dual VRAM — do not blank with void */
+        else if (s_present_h2h_full_frame && use_snap && col >= 0)
+          continue; /* keep dual VRAM in native strip — do not blank */
+        else if (mw_bg1_tile_void(live_t) && col < 0)
+          continue; /* west still undecoded — leave miss/transparent */
         else
           t = live_t;
       }
