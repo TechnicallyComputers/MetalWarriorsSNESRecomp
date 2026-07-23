@@ -114,10 +114,9 @@ if(WIN32)
     target_link_libraries(MetalWarriorsSNESRecomp PRIVATE ws2_32 dbghelp)
 endif()
 
-# Shared recomp-ui pre-boot launcher. It owns presentation only; the SNES
-# lobby/netcode implementation is supplied through the callbacks in main.c.
-include(${CMAKE_SOURCE_DIR}/recomp-ui/recomp_ui.cmake)
-recomp_target_launcher_ui(MetalWarriorsSNESRecomp)
+# Shared Dear ImGui pre-boot launcher from snesrecomp's lib/recomp-ui submodule.
+# Presentation only; lobby/netcode are supplied through callbacks in main.c.
+snesrecomp_enable_launcher_ui(MetalWarriorsSNESRecomp)
 
 # Delay-sync netplay + MotK lobby client (LAN by default; opt into ICE with
 # -DSNESRECOMP_NET_ICE=ON when libjuice is available).

@@ -2694,7 +2694,7 @@ static const char kDefaultConfigIniContent[] =
   "# perf if your display is set to exactly 60hz)\n"
   "DisableFrameDelay = 0\n"
   "\n"
-  "# 0 = show the RmlUi launcher by default. 1 = boot straight to the game.\n"
+  "# 0 = show the recomp-ui launcher by default. 1 = boot straight to the game.\n"
   "# Force the launcher with --launcher; skip with --no-launcher.\n"
   "SkipLauncher = 0\n"
   "\n"
