@@ -50,8 +50,9 @@
 #include "snes_lobby_client.h"
 #endif
 #include "snes_netplay.h"
-#include "recomp_net/address.h"
-#include "recomp_net/lan_lobby.h"
+#include "snes_host_session.h"
+#include "snes_host_lobby.h"
+#include "snes_host_app.h"
 
 typedef struct GamepadInfo {
   uint32 modifiers;
@@ -161,525 +162,37 @@ static int g_netplay_from_lobby;
 extern Snes *g_snes;
 
 #if defined(RECOMP_LAUNCHER)
-static char g_launcher_lobby_url[256];
-static int g_launcher_hosting_lan;
-static int g_launcher_joined_lan;
-static RecompLauncherCNetplayLaunch g_launcher_lan_launch;
-#define LAUNCHER_MAX_LOCAL_ADDRESSES 32
-static RNetIpv4Address
-    g_launcher_local_addresses[LAUNCHER_MAX_LOCAL_ADDRESSES];
-static int g_launcher_local_address_count;
-static char g_launcher_external_ip[RNET_IPV4_ADDRESS_TEXT_MAX];
-
-static const char *LauncherLanLobbyPath(void) {
-  return "netplay_lan_lobby.txt";
-}
-
-static int LauncherReadLanState(RNetLanLobby *state) {
-  return rnet_lan_lobby_read(LauncherLanLobbyPath(), "Metal Warriors",
-                             SNES_GAME_VERSION, state) == RNET_LAN_LOBBY_OK;
-}
-
-static int LauncherCreateLanState(const char *name, const char *endpoint,
-                                  const char *password) {
-  RNetLanLobby state;
-  memset(&state, 0, sizeof(state));
-  snprintf(state.name, sizeof(state.name), "%s",
-           name && name[0] ? name : "LAN Lobby");
-  snprintf(state.game, sizeof(state.game), "Metal Warriors");
-  snprintf(state.game_version, sizeof(state.game_version), "%s",
-           SNES_GAME_VERSION);
-  snprintf(state.endpoint, sizeof(state.endpoint), "%s",
-           endpoint && endpoint[0] ? endpoint : "127.0.0.1:7777");
-  snprintf(state.host_name, sizeof(state.host_name), "%s",
-           snes_lobby_display_name()[0] ? snes_lobby_display_name() : "Host");
-  snprintf(state.password, sizeof(state.password), "%s", password ? password : "");
-  state.host_slot = 0;
-  if (rnet_lan_lobby_publish(LauncherLanLobbyPath(), &state) !=
-      RNET_LAN_LOBBY_OK) return 0;
-  g_launcher_hosting_lan = 1;
-  g_launcher_joined_lan = 0;
-  memset(&g_launcher_lan_launch, 0, sizeof(g_launcher_lan_launch));
-  return 1;
-}
-
-static int LauncherFillLanLobbyRow(RecompLauncherCNetplayLobby *out) {
-  RNetLanLobby state;
-  if (!out || !LauncherReadLanState(&state)) return 0;
-  memset(out, 0, sizeof(*out));
-  snprintf(out->lobby_id, sizeof(out->lobby_id), "lan:%s", state.endpoint);
-  snprintf(out->name, sizeof(out->name), "LAN - %s",
-           state.name[0] ? state.name : "Lobby");
-  snprintf(out->game_name, sizeof(out->game_name), "%s", state.game);
-  snprintf(out->game_version, sizeof(out->game_version), "%s",
-           state.game_version);
-  out->player_count = state.joiner_name[0] ? 2 : 1;
-  out->max_slots = 2;
-  out->has_password = state.password[0] != '\0';
-  return 1;
-}
-
-static void LauncherClearLanJoinerSeat(void) {
-  g_launcher_joined_lan = 0;
-  memset(&g_launcher_lan_launch, 0, sizeof(g_launcher_lan_launch));
-}
-
-/* Joiner watches the file registry: empty/missing guest seat means kicked. */
-static void LauncherSyncLanJoinerSeat(void) {
-  RNetLanLobby state;
-  const char *name;
-  if (!g_launcher_joined_lan) return;
-  if (!LauncherReadLanState(&state)) {
-    LauncherClearLanJoinerSeat();
-    return;
-  }
-  name = snes_lobby_display_name();
-  if (!state.joiner_name[0] ||
-      (name && name[0] && strcmp(state.joiner_name, name) != 0))
-    LauncherClearLanJoinerSeat();
-}
-
-static int LauncherUseLanMembers(RNetLanLobby *state) {
-  RNetLanLobby local;
-  if (!state) state = &local;
-  LauncherSyncLanJoinerSeat();
-  if (!LauncherReadLanState(state)) return 0;
-  if (g_launcher_joined_lan) return 1;
-  if (!g_launcher_hosting_lan) return 0;
-  return state->joiner_name[0] || snes_lobby_member_count() < 2;
-}
-
-static SnesLobbyMatchCaps LauncherNetplayCaps(
-    const RecompLauncherCSettings *settings) {
-  SnesLobbyMatchCaps caps;
-  memset(&caps, 0, sizeof(caps));
-  caps.valid = 1;
-  caps.widescreen = 1;
-  caps.widescreen_hud = 1;
-  caps.ignore_aspect = settings ? settings->ignore_aspect != 0 : 0;
-  caps.input_delay = 2;
-  caps.ws_extra = 71;
-  return caps;
-}
-
-static const char *LauncherNpDefaultUrl(void *ctx) {
+static void MwFillMatchCaps(void *ctx, const void *settings_v,
+                            SnesLobbyMatchCaps *out) {
+  const RecompLauncherCSettings *settings =
+      (const RecompLauncherCSettings *)settings_v;
   (void)ctx;
-  return g_launcher_lobby_url[0] ? g_launcher_lobby_url
-                                 : snes_lobby_default_url();
+  if (!out) return;
+  out->valid = 1;
+  out->widescreen = 1;
+  out->widescreen_hud = 1;
+  out->ignore_aspect = settings ? settings->ignore_aspect != 0 : 0;
+  out->input_delay = 2;
+  out->ws_extra = 71;
 }
 
-static void LauncherNpSetUrl(void *ctx, const char *url) {
-  (void)ctx;
-  snprintf(g_launcher_lobby_url, sizeof(g_launcher_lobby_url), "%s",
-           url && url[0] ? url : snes_lobby_default_url());
+static void MwHostLobbyEnsureInit(void) {
+  static int once;
+  SnesHostLobbyIdentity id;
+  SnesHostLobbyOpts opts;
+  if (once) return;
+  once = 1;
+  memset(&id, 0, sizeof(id));
+  id.game_name = "Metal Warriors";
+  id.game_version = SNES_GAME_VERSION;
+  id.lan_registry_path = "netplay_lan_lobby.txt";
+  id.default_lobby_name = "Netplay Lobby";
+  memset(&opts, 0, sizeof(opts));
+  opts.rematch_set_ready = 1;
+  opts.fill_match_caps = &MwFillMatchCaps;
+  if (snes_host_lobby_init(&id, &opts) != 0)
+    fprintf(stderr, "metalwarriors: snes_host_lobby_init failed\n");
 }
-
-static int LauncherNpConnect(void *ctx) {
-  (void)ctx;
-  snes_lobby_set_game_identity("Metal Warriors", SNES_GAME_VERSION);
-  return snes_lobby_connect(LauncherNpDefaultUrl(NULL));
-}
-
-static int LauncherNpConnected(void *ctx) {
-  (void)ctx;
-  return snes_lobby_connected();
-}
-
-static void LauncherNpPump(void *ctx) {
-  (void)ctx;
-  snes_lobby_pump();
-  LauncherSyncLanJoinerSeat();
-}
-
-static void LauncherNpSetPlayerName(void *ctx, const char *name) {
-  (void)ctx;
-  snes_lobby_set_display_name(name && name[0] ? name : "Player");
-}
-
-static const char *LauncherNpPlayerName(void *ctx) {
-  (void)ctx;
-  return snes_lobby_display_name();
-}
-
-static void LauncherNpRequestList(void *ctx) {
-  (void)ctx;
-  snes_lobby_request_list();
-}
-
-static int LauncherNpListCount(void *ctx) {
-  RecompLauncherCNetplayLobby lan;
-  (void)ctx;
-  return snes_lobby_list_count() + (LauncherFillLanLobbyRow(&lan) ? 1 : 0);
-}
-
-static int LauncherNpListGet(void *ctx, int index,
-                             RecompLauncherCNetplayLobby *out) {
-  SnesLobbyRow row;
-  int remote_count;
-  (void)ctx;
-  if (!out || index < 0) return 0;
-  remote_count = snes_lobby_list_count();
-  if (index >= remote_count)
-    return index == remote_count ? LauncherFillLanLobbyRow(out) : 0;
-  if (!snes_lobby_list_get(index, &row)) return 0;
-  memset(out, 0, sizeof(*out));
-  snprintf(out->lobby_id, sizeof(out->lobby_id), "%s", row.lobby_id);
-  snprintf(out->name, sizeof(out->name), "%s", row.name);
-  snprintf(out->game_name, sizeof(out->game_name), "%s", row.game_name);
-  snprintf(out->game_version, sizeof(out->game_version), "%s",
-           row.game_version);
-  out->player_count = row.player_count;
-  out->max_slots = row.max_slots;
-  out->has_password = row.has_password;
-  return 1;
-}
-
-static int LauncherRefreshLocalAddresses(void) {
-  int count = rnet_ipv4_enumerate(
-      g_launcher_local_addresses, LAUNCHER_MAX_LOCAL_ADDRESSES);
-  if (count < 0) count = 0;
-  if (count > LAUNCHER_MAX_LOCAL_ADDRESSES)
-    count = LAUNCHER_MAX_LOCAL_ADDRESSES;
-  g_launcher_local_address_count = count;
-  return count;
-}
-
-static int LauncherNpLocalAddressGet(
-    void *ctx, int index, RecompLauncherCNetplayLocalAddress *out) {
-  (void)ctx;
-  if (!out || index < 0) return 0;
-  if (index == 0) LauncherRefreshLocalAddresses();
-  if (index >= g_launcher_local_address_count) return 0;
-  memset(out, 0, sizeof(*out));
-  snprintf(out->address, sizeof(out->address), "%s",
-           g_launcher_local_addresses[index].address);
-  snprintf(out->label, sizeof(out->label), "%s",
-           g_launcher_local_addresses[index].interface_label);
-  return 1;
-}
-
-static int LauncherNpLocalIp(void *ctx, char *out, size_t out_len) {
-  RecompLauncherCNetplayLocalAddress address;
-  if (!out || !out_len || !LauncherNpLocalAddressGet(ctx, 0, &address))
-    return 0;
-  snprintf(out, out_len, "%s", address.address);
-  return out[0] != '\0';
-}
-
-static int LauncherNpExternalIp(void *ctx, char *out, size_t out_len) {
-  RNetExternalIpv4Config config;
-  int rc;
-  (void)ctx;
-  if (!out || !out_len) return 0;
-  if (!g_launcher_external_ip[0]) {
-    rnet_external_ipv4_config_init(&config);
-    /* This callback currently runs on the launcher render thread. Keep the
-     * STUN wait short; a later recomp-ui API can make discovery asynchronous. */
-    config.timeout_ms = 900;
-    rc = rnet_external_ipv4_discover(&config, g_launcher_external_ip,
-                                     sizeof(g_launcher_external_ip));
-    if (rc != RNET_EXTERNAL_IPV4_OK) {
-      fprintf(stderr, "metalwarriors: external IPv4 discovery failed (%d)\n",
-              rc);
-      snprintf(out, out_len, "Unavailable");
-      return 0;
-    }
-  }
-  snprintf(out, out_len, "%s", g_launcher_external_ip);
-  return out[0] != '\0';
-}
-
-static int LauncherNpCreate(void *ctx, const char *lobby_name,
-                            char *host_endpoint, const char *password,
-                            const RecompLauncherCSettings *settings,
-                            int lan_only) {
-  SnesLobbyMatchCaps caps = LauncherNetplayCaps(settings);
-  (void)ctx;
-  /* host_endpoint is in/out (capacity >= 64). recomp-ui already applied the
-   * universal UDP port policy (LAN exact / online auto-pick) before create. */
-  if (!host_endpoint) return -1;
-  if (!host_endpoint[0])
-    snprintf(host_endpoint, 64, lan_only ? "127.0.0.1:7777" : "0.0.0.0:7777");
-  /* Advertise on exactly one channel. LAN and server lobbies use different
-   * join/member/start paths; dual-publish produced duplicate list rows. */
-  if (lan_only) {
-    if (!LauncherCreateLanState(lobby_name, host_endpoint, password)) return -1;
-    return 0;
-  }
-  /* Online: clear any stale same-machine LAN row so it cannot appear beside
-   * the server lobby in the merged list. */
-  (void)rnet_lan_lobby_leave(LauncherLanLobbyPath(), 1);
-  g_launcher_hosting_lan = 0;
-  g_launcher_joined_lan = 0;
-  memset(&g_launcher_lan_launch, 0, sizeof(g_launcher_lan_launch));
-  return snes_lobby_create(
-      lobby_name && lobby_name[0] ? lobby_name : "Netplay Lobby",
-      "Metal Warriors", SNES_GAME_VERSION, password ? password : "",
-      host_endpoint, &caps);
-}
-
-static int LauncherNpJoin(void *ctx, const char *lobby_id,
-                          const char *password, char *guest_bind) {
-  RNetLanLobby state;
-  const char *name;
-  (void)ctx;
-  memset(&g_launcher_lan_launch, 0, sizeof(g_launcher_lan_launch));
-  if (lobby_id && strncmp(lobby_id, "lan:", 4) == 0) {
-    (void)guest_bind;
-    name = snes_lobby_display_name();
-    if (rnet_lan_lobby_join(LauncherLanLobbyPath(), "Metal Warriors",
-                            SNES_GAME_VERSION, password ? password : "",
-                            name && name[0] ? name : "Player", &state) !=
-        RNET_LAN_LOBBY_OK) return -1;
-    g_launcher_hosting_lan = 0;
-    g_launcher_joined_lan = 1;
-    return 0;
-  }
-  g_launcher_hosting_lan = 0;
-  g_launcher_joined_lan = 0;
-  return snes_lobby_join(lobby_id, password ? password : "", guest_bind);
-}
-
-static int LauncherNpLeave(void *ctx) {
-  int rc;
-  (void)ctx;
-  if (g_launcher_hosting_lan)
-    (void)rnet_lan_lobby_leave(LauncherLanLobbyPath(), 1);
-  else if (g_launcher_joined_lan)
-    (void)rnet_lan_lobby_leave(LauncherLanLobbyPath(), 0);
-  g_launcher_hosting_lan = 0;
-  g_launcher_joined_lan = 0;
-  memset(&g_launcher_lan_launch, 0, sizeof(g_launcher_lan_launch));
-  rc = snes_lobby_leave();
-  return rc;
-}
-
-static int LauncherNpInLobby(void *ctx) {
-  (void)ctx;
-  LauncherSyncLanJoinerSeat();
-  return g_launcher_hosting_lan || g_launcher_joined_lan ||
-         snes_lobby_in_lobby();
-}
-
-static int LauncherNpIsHost(void *ctx) {
-  (void)ctx;
-  if (g_launcher_hosting_lan || g_launcher_joined_lan)
-    return g_launcher_hosting_lan ? 1 : 0;
-  return snes_lobby_is_host();
-}
-
-static int LauncherNpMemberCount(void *ctx) {
-  (void)ctx;
-  RNetLanLobby state;
-  return LauncherUseLanMembers(&state) ? 2 : snes_lobby_member_count();
-}
-
-static int LauncherNpMemberGet(void *ctx, int index,
-                               RecompLauncherCNetplayMember *out) {
-  SnesLobbyMember member;
-  RNetLanLobby state;
-  (void)ctx;
-  if (!out) return 0;
-  memset(out, 0, sizeof(*out));
-  if (LauncherUseLanMembers(&state)) {
-    if (index < 0 || index > 1) return 0;
-    out->slot = index == 0 ? state.host_slot : 1 - state.host_slot;
-    out->ready = index == 0 || state.joiner_name[0] != '\0';
-    out->is_host = index == 0;
-    snprintf(out->display_name, sizeof(out->display_name), "%s",
-             index == 0 ? state.host_name : state.joiner_name);
-    return 1;
-  }
-  if (!snes_lobby_member_get(index, &member)) return 0;
-  out->slot = member.slot;
-  out->ready = member.ready;
-  {
-    const char *host_id = snes_lobby_host_player_id();
-    out->is_host = host_id && host_id[0] &&
-                   strcmp(member.player_id, host_id) == 0;
-  }
-  snprintf(out->display_name, sizeof(out->display_name), "%s",
-           member.display_name);
-  return 1;
-}
-
-static int LauncherNpMoveMember(void *ctx, int from_slot, int to_slot) {
-  RNetLanLobby state;
-  (void)ctx;
-  if (g_launcher_hosting_lan && from_slot >= 0 && from_slot <= 1 &&
-      to_slot >= 0 && to_slot <= 1 && from_slot != to_slot &&
-      LauncherReadLanState(&state))
-    return rnet_lan_lobby_set_host_slot(LauncherLanLobbyPath(),
-                                        1 - state.host_slot);
-  if (g_launcher_joined_lan) return -1;
-  return snes_lobby_move(from_slot, to_slot);
-}
-
-static int LauncherNpKickMember(void *ctx, int slot) {
-  RNetLanLobby state;
-  int guest_slot;
-  (void)ctx;
-  if (g_launcher_hosting_lan) {
-    if (slot < 0 || slot > 1 || !LauncherReadLanState(&state)) return -1;
-    guest_slot = 1 - state.host_slot;
-    if (slot != guest_slot || !state.joiner_name[0]) return -1;
-    return rnet_lan_lobby_kick(LauncherLanLobbyPath()) == RNET_LAN_LOBBY_OK
-               ? 0
-               : -1;
-  }
-  if (g_launcher_joined_lan) return -1;
-  return snes_lobby_kick(slot);
-}
-
-static int LauncherNpLocalReady(void *ctx) {
-  (void)ctx;
-  if (g_launcher_hosting_lan || g_launcher_joined_lan) return 1;
-  return snes_lobby_local_ready();
-}
-
-static int LauncherNpAllReady(void *ctx) {
-  (void)ctx;
-  RNetLanLobby state;
-  if (LauncherUseLanMembers(&state)) return state.joiner_name[0] != '\0';
-  return snes_lobby_all_ready();
-}
-
-static int LauncherNpSetReady(void *ctx, int ready) {
-  (void)ctx;
-  if (g_launcher_hosting_lan || g_launcher_joined_lan) return 0;
-  return snes_lobby_set_ready(ready);
-}
-
-static void LauncherArmLanLaunchFromState(const RNetLanLobby *state) {
-  const char *colon;
-  const char *port;
-  if (!state) return;
-  memset(&g_launcher_lan_launch, 0, sizeof(g_launcher_lan_launch));
-  g_launcher_lan_launch.enabled = 1;
-  g_launcher_lan_launch.local_slot =
-      g_launcher_hosting_lan ? state->host_slot : 1 - state->host_slot;
-  g_launcher_lan_launch.input_player = 0;
-  g_launcher_lan_launch.session_id = 1;
-  g_launcher_lan_launch.input_delay = 2;
-  if (g_launcher_hosting_lan) {
-    colon = strrchr(state->endpoint, ':');
-    port = colon ? colon + 1 : "7777";
-    snprintf(g_launcher_lan_launch.bind_hostport,
-             sizeof(g_launcher_lan_launch.bind_hostport), "0.0.0.0:%s", port);
-  } else {
-    snprintf(g_launcher_lan_launch.bind_hostport,
-             sizeof(g_launcher_lan_launch.bind_hostport), "0.0.0.0:0");
-    snprintf(g_launcher_lan_launch.peer_hostport,
-             sizeof(g_launcher_lan_launch.peer_hostport), "%s", state->endpoint);
-  }
-}
-
-static int LauncherNpRequestStart(void *ctx,
-                                  const RecompLauncherCSettings *settings) {
-  SnesLobbyMatchCaps caps = LauncherNetplayCaps(settings);
-  RNetLanLobby state;
-  (void)ctx;
-  /* LAN host start is file-backed — never fall through to the WS client. */
-  if (g_launcher_hosting_lan) {
-    if (!LauncherReadLanState(&state) || !state.joiner_name[0]) return -1;
-    if (rnet_lan_lobby_set_started(LauncherLanLobbyPath(), 1) !=
-        RNET_LAN_LOBBY_OK)
-      return -1;
-    state.started = 1;
-    LauncherArmLanLaunchFromState(&state);
-    return 0;
-  }
-  return snes_lobby_request_start(&caps);
-}
-
-static int LauncherNpLaunchPending(void *ctx) {
-  RNetLanLobby state;
-  (void)ctx;
-  if ((g_launcher_hosting_lan || g_launcher_joined_lan) &&
-      !g_launcher_lan_launch.enabled && LauncherReadLanState(&state) &&
-      state.started)
-    LauncherArmLanLaunchFromState(&state);
-  return g_launcher_lan_launch.enabled || snes_lobby_launch_pending();
-}
-
-static void LauncherNpClearLaunchPending(void *ctx) {
-  (void)ctx;
-  memset(&g_launcher_lan_launch, 0, sizeof(g_launcher_lan_launch));
-  snes_lobby_clear_launch_pending();
-}
-
-static const char *LauncherNpLastError(void *ctx) {
-  const SnesLobbyJoinInfo *join;
-  (void)ctx;
-  join = snes_lobby_join_info();
-  return (join && join->last_error[0]) ? join->last_error : "";
-}
-
-static void LauncherNpClearLastError(void *ctx) {
-  (void)ctx;
-  snes_lobby_clear_last_error();
-}
-
-static int LauncherNpFillLaunch(void *ctx,
-                                RecompLauncherCNetplayLaunch *out) {
-  SnesLobbyJoinInfo join;
-  const SnesLobbyMatchCaps *caps;
-  (void)ctx;
-  if (!out) return 0;
-  if (g_launcher_lan_launch.enabled) {
-    *out = g_launcher_lan_launch;
-    return 1;
-  }
-  /* Online: snes_lobby_try_fill_launch gates on op:launch + usable endpoints. */
-  if (!snes_lobby_try_fill_launch(&join)) return 0;
-  caps = snes_lobby_match_caps();
-  memset(out, 0, sizeof(*out));
-  out->enabled = 1;
-  out->local_slot = join.local_slot;
-  out->input_player = 0;
-  out->session_id = join.session_id;
-  out->input_delay = caps && caps->valid ? caps->input_delay : 2;
-  snprintf(out->bind_hostport, sizeof(out->bind_hostport), "%s",
-           join.bind_hostport);
-  snprintf(out->peer_hostport, sizeof(out->peer_hostport), "%s",
-           join.peer_hostport);
-  return 1;
-}
-
-static RecompLauncherCNetplayCallbacks g_launcher_netplay_callbacks = {
-  NULL,
-  LauncherNpDefaultUrl,
-  LauncherNpSetUrl,
-  LauncherNpConnect,
-  LauncherNpConnected,
-  LauncherNpPump,
-  LauncherNpSetPlayerName,
-  LauncherNpPlayerName,
-  LauncherNpRequestList,
-  LauncherNpListCount,
-  LauncherNpListGet,
-  LauncherNpLocalIp,
-  LauncherNpExternalIp,
-  LauncherNpCreate,
-  LauncherNpJoin,
-  LauncherNpLeave,
-  LauncherNpInLobby,
-  LauncherNpIsHost,
-  LauncherNpMemberCount,
-  LauncherNpMemberGet,
-  LauncherNpMoveMember,
-  LauncherNpLocalReady,
-  LauncherNpAllReady,
-  LauncherNpSetReady,
-  LauncherNpRequestStart,
-  LauncherNpLaunchPending,
-  LauncherNpClearLaunchPending,
-  LauncherNpFillLaunch,
-  LauncherNpLocalAddressGet,
-  LauncherNpKickMember,
-  LauncherNpLastError,
-  LauncherNpClearLastError,
-};
 #endif
 
 // --- Scripted input ---
@@ -1480,7 +993,8 @@ int main(int argc, char** argv) {
         gi.sram_path = "saves/save.srm";
         gi.config_path = config_file;
         gi.netplay_supported = 1;
-        gi.netplay = &g_launcher_netplay_callbacks;
+        MwHostLobbyEnsureInit();
+    gi.netplay = snes_host_lobby_callbacks();
 
         char initial_rom[512] = "";
         if (has_positional_rom)
@@ -1504,8 +1018,7 @@ int main(int argc, char** argv) {
             rom_path_buf, sizeof(rom_path_buf));
         RecompLauncherCNetplayLaunch net = ls.netplay_launch;
         if (lr == 1) {
-          if (g_launcher_hosting_lan || g_launcher_joined_lan)
-            (void)LauncherNpLeave(NULL);
+          snes_host_lobby_leave();
           host_report_breadcrumb("launcher: quit");
           return 0;
         }
@@ -1681,21 +1194,11 @@ int main(int argc, char** argv) {
 
   static int s_emu_session = 0;
 session_reboot:
-  /* Soft-return rematch: recomp-ui launcher_platform_close() calls SDL_Quit().
-   * Re-init before recreating the window/audio. First boot already inited
-   * above; skip when subsystems are still live. */
-  if (!SDL_WasInit(SDL_INIT_VIDEO) || !SDL_WasInit(SDL_INIT_AUDIO) ||
-      !SDL_WasInit(SDL_INIT_GAMECONTROLLER)) {
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) !=
-        0) {
-      host_report_breadcrumb("SDL_Init (session) FAILED: %s", SDL_GetError());
-      printf("Failed to init SDL: %s\n", SDL_GetError());
-      return 1;
-    }
-    host_report_breadcrumb(
-        "SDL session init ok: video=%s audio=%s",
-        SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : "(none)",
-        SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "(none)");
+  /* Soft-return rematch: recomp-ui may have SDL_Quit()'d — engine helper. */
+  if (snes_host_ensure_sdl() != 0) {
+    host_report_breadcrumb("SDL_Init (session) FAILED: %s", SDL_GetError());
+    printf("Failed to init SDL: %s\n", SDL_GetError());
+    return 1;
   }
   /* Rematch after lobby soft-return re-enters here with updated netplay cfg. */
   {
@@ -1704,9 +1207,8 @@ session_reboot:
       host_report_breadcrumb("netplay: rematch session reboot");
   }
 
-  /* MotK-class sticky latch: LLE resume PC / host_frames survive snes_free.
-   * Clear before SnesInit so rematch cold-boots instead of WAI on a blank chip. */
-  MwSessionReset();
+  /* RtlGameInfo.session_reset → MwSessionReset (sticky LLE / widescreen). */
+  snes_host_session_reset();
 
   /* Netplay: forced expand 71 (peer lock) + full-frame H2H present (default).
    * Offline: WS hard-off for native dual split + local multiplayer.
@@ -2165,13 +1667,7 @@ error_reading:;
 #if defined(RECOMP_LAUNCHER)
   if (snes_netplay_return_to_lobby_requested() && g_netplay_from_lobby) {
     /* Soft-return: keep lobby WebSocket; reopen MotK room view. */
-    if (g_launcher_hosting_lan || g_launcher_joined_lan)
-      (void)rnet_lan_lobby_set_started(LauncherLanLobbyPath(), 0);
-    /* Auto-ready: there is no Ready toggle; keep seats launchable on rematch
-     * (including older lobby servers that still gate start on all_ready). */
-    snes_lobby_set_ready(1);
-    snes_lobby_clear_launch_pending();
-    snes_netplay_clear_return_to_lobby();
+    snes_host_app_begin_soft_return(NULL, 0);
     g_netplay_from_lobby = 0;
     g_netplay_pending = 0;
 
@@ -2200,7 +1696,8 @@ error_reading:;
     gi.sram_path = "saves/save.srm";
     gi.config_path = config_file;
     gi.netplay_supported = 1;
-    gi.netplay = &g_launcher_netplay_callbacks;
+    MwHostLobbyEnsureInit();
+    gi.netplay = snes_host_lobby_callbacks();
 
     char resume_rom[512];
     snprintf(resume_rom, sizeof(resume_rom), "%s", rom_path_buf);
@@ -2250,17 +1747,13 @@ error_reading:;
       g_netplay_cfg.enabled = 0;
       g_netplay_pending = 0;
       g_netplay_from_lobby = 0;
-      if (g_launcher_hosting_lan || g_launcher_joined_lan)
-        (void)LauncherNpLeave(NULL);
-      snes_lobby_disconnect();
+      snes_host_lobby_disconnect();
       host_report_breadcrumb("launcher: offline launch after lobby");
       goto session_reboot;
     }
 
     fprintf(stderr, "metalwarriors: lobby closed after match; exiting.\n");
-    if (g_launcher_hosting_lan || g_launcher_joined_lan)
-      (void)LauncherNpLeave(NULL);
-    snes_lobby_disconnect();
+    snes_host_lobby_disconnect();
     free(kRom);
 #ifdef __SWITCH__
     SwitchImpl_Exit();
@@ -2271,8 +1764,7 @@ error_reading:;
 #endif
 
 #if defined(RECOMP_LAUNCHER)
-  if (g_launcher_hosting_lan || g_launcher_joined_lan)
-    (void)LauncherNpLeave(NULL);
+  snes_host_lobby_leave();
 #endif
   free(kRom);
 #ifdef __SWITCH__
@@ -2478,18 +1970,10 @@ static uint16_t CaptureLocalNetplayButtons(void) {
 
 /* Send BYE and, when the match started from the lobby, request soft-return. */
 static void netplay_soft_exit(const char *origin) {
-  snes_netplay_shutdown();
-#if defined(RECOMP_LAUNCHER)
-  if (g_netplay_from_lobby) {
-    fprintf(stderr, "metalwarriors: netplay ended (%s) — returning to lobby\n",
-            origin ? origin : "?");
+  snes_netplay_soft_exit_to_lobby(origin, g_netplay_from_lobby);
+  if (g_netplay_from_lobby)
     host_report_breadcrumb("netplay: ended (%s) — returning to lobby",
                            origin ? origin : "?");
-    snes_netplay_request_return_to_lobby();
-  }
-#else
-  (void)origin;
-#endif
 }
 
 /*

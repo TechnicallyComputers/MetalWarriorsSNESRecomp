@@ -10,4 +10,5 @@ const RtlGameInfo kSmwGameInfo = {
   .state_save_extra = &MwStateSaveExtra,
   .state_load_extra = &MwStateLoadExtra,
   .on_state_loaded = &MwOnStateLoaded,
+  .session_reset = &MwSessionReset,
 };

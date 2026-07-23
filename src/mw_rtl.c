@@ -243,14 +243,26 @@ static void mw_prop_home_reset(void) {
 
 static int mw_prop_slot_for_obj(uint16_t obj) {
   int free_i = -1;
+  int trail_i = -1;
+  /* Prefer sticky match so trail/sticky never diverge across two slots
+   * (trail-first lookup + prop_alive wipe was thrashing sn every few frames). */
   for (int i = 0; i < kMwPropHomeMax; i++) {
-    if (s_prop_trail_obj[i] == obj || s_prop_sticky_obj[i] == obj)
+    if (s_prop_sticky_obj[i] == obj)
       return i;
+    if (trail_i < 0 && s_prop_trail_obj[i] == obj)
+      trail_i = i;
     if (free_i < 0 && !s_prop_trail_obj[i] && !s_prop_sticky_obj[i])
       free_i = i;
   }
+  if (trail_i >= 0)
+    return trail_i;
   if (free_i >= 0)
     return free_i;
+  /* Last resort: only steal a slot that has no live sticky tiles. */
+  for (int i = 0; i < kMwPropHomeMax; i++) {
+    if (!s_prop_sticky_valid[i])
+      return i;
+  }
   return (int)((obj - 0x1934u) / 0x1Cu) % kMwPropHomeMax;
 }
 
@@ -874,12 +886,21 @@ static uint16_t mw_bg1_snap_word(int slot, uint16_t src, uint16_t pitch,
   int p = pitch ? (int)pitch : (int)snap->pitch;
   if (p < 32)
     p = 0x290;
+  /* Full-frame: reject snap captured on a different dual-cam column so west
+   * / new cols do not remap the peer's stripe into this present. */
+  if (s_present_h2h_full_frame && src && snap->src &&
+      !mw_bg1_src_same_column(src, snap->src, (uint16_t)p))
+    return 0;
   const int delta = (int)src - (int)snap->src;
   const int d_rows = delta / p;
   const int rem = delta - d_rows * p;
   if (rem & 1)
     return 0;
   const int d_cols = rem / 2;
+  /* Cap column remap — large d_cols were pulling far-east mover cells into
+   * the west gutter / native strip. */
+  if (d_cols > kMwBg1SnapWest || d_cols < -kMwBg1SnapWest)
+    return 0;
   const int rr = row + d_rows;
   const int cc = col + d_cols + kMwBg1SnapWest;
   if (rr < 0 || rr >= kMwBg1SnapRows || cc < 0 || cc >= kMwBg1SnapCols)
@@ -3081,7 +3102,8 @@ static void mw_coldump_tick(int local_slot) {
           (s_coldump_bg_obj[ps] == idx) ? (unsigned)s_coldump_bg_hit[ps] : 0u;
       const unsigned bg_try =
           (s_coldump_bg_obj[ps] == idx) ? (unsigned)s_coldump_bg_try[ps] : 0u;
-      const int draw = (home == slot && sn > 0 && act) ? 1 : 0;
+      /* draw heuristic: home peer with sticky (act bit flickers; not required). */
+      const int draw = (home == slot && sn > 0) ? 1 : 0;
       const int sx = (int)wx - (int)loc_x;
       const int sy = (int)wy - (int)loc_y;
 
@@ -3467,6 +3489,12 @@ static void mw_present_rebuild_layer_strip(int layer, uint16_t cam_x,
   if (layer == 0 && (local_slot == 0 || local_slot == 1) &&
       s_sticky_src_bg1_slot[local_slot])
     sticky = s_sticky_src_bg1_slot[local_slot];
+  /* Drop sticky from another dual-cam column — same_column false means the
+   * last DMA stripe is the peer's stream; using it phase-shifts mover dirt
+   * into this peer's top rows. */
+  if (layer == 0 && sticky && src_w &&
+      !mw_bg1_src_same_column(src_w, sticky, pitch))
+    sticky = 0;
   const uint16_t live =
       (layer == 0)
           ? (s_nmi_latched ? s_nmi_src_bg1 : mw_wram16(0x1E36))
@@ -3474,39 +3502,47 @@ static void mw_present_rebuild_layer_strip(int layer, uint16_t cam_x,
   uint16_t src = src_w ? src_w : (sticky ? sticky : live);
   int src_path = src_w ? 1 : 0;
 
-  /* Live/sticky Y-adjust keeps the DMA stripe's *column*. On full-frame H2H
-   * that column is often still the other cam's stream — only apply when the
-   * bases share a column (whole-pitch row drift), or when there is no world
-   * src. Prefer raw 42B3 walk over foreign sticky when full-frame. */
+  /*
+   * Live/sticky Y-adjust keeps the DMA stripe's *column* when the half-frame
+   * path recenters (raw_cam_y ≠ scroll_y). On full-frame H2H with a valid
+   * 42B3 walk: NEVER replace src_w with sticky/live — with y_bg=0 that
+   * adjust was d_tiles=0 ⇒ src=sticky, painting the dual stream's
+   * mover-dirty rows into the local strip (P1 ledge tip at top of P2).
+   */
   if (layer == 0 && raw_cam_y != 0) {
-    const uint16_t live_src = sticky ? sticky : live;
-    const int allow_live =
-        live_src &&
-        (!src_w || mw_bg1_src_same_column(src_w, live_src, pitch));
-    if (allow_live) {
-      const unsigned sh = PPU_bigTiles(g_ppu, 0) ? 4u : 3u;
-      const int tile_px = 1 << (int)sh;
-      const int dy = (int)raw_cam_y - (int)scroll_y; /* usually y_bg */
-      const int d_tiles = dy / tile_px;
-      const int adj = (int)live_src - d_tiles * (int)pitch;
-      if (adj > 0 && adj < 0x10000) {
-        src = (uint16_t)adj;
-        if (!src_w)
-          src_path = 4;
-      }
-    } else if (!src && s_present_h2h_full_frame) {
-      const uint16_t src_raw = mw_map_src_from_42b3(scroll_x, raw_cam_y);
-      if (src_raw) {
-        const int dy = (int)raw_cam_y - (int)scroll_y;
-        const int d_tiles = dy / 16;
-        const int adj = (int)src_raw - d_tiles * (int)pitch;
+    if (s_present_h2h_full_frame && src_w) {
+      src = src_w;
+      src_path = 1;
+    } else {
+      const uint16_t live_src = sticky ? sticky : live;
+      const int allow_live =
+          live_src &&
+          (!src_w || mw_bg1_src_same_column(src_w, live_src, pitch));
+      if (allow_live) {
+        const unsigned sh = PPU_bigTiles(g_ppu, 0) ? 4u : 3u;
+        const int tile_px = 1 << (int)sh;
+        const int dy = (int)raw_cam_y - (int)scroll_y; /* usually y_bg */
+        const int d_tiles = dy / tile_px;
+        const int adj = (int)live_src - d_tiles * (int)pitch;
         if (adj > 0 && adj < 0x10000) {
           src = (uint16_t)adj;
-          src_path = 2;
+          if (!src_w)
+            src_path = 4;
         }
+      } else if (!src && s_present_h2h_full_frame) {
+        const uint16_t src_raw = mw_map_src_from_42b3(scroll_x, raw_cam_y);
+        if (src_raw) {
+          const int dy = (int)raw_cam_y - (int)scroll_y;
+          const int d_tiles = dy / 16;
+          const int adj = (int)src_raw - d_tiles * (int)pitch;
+          if (adj > 0 && adj < 0x10000) {
+            src = (uint16_t)adj;
+            src_path = 2;
+          }
+        }
+        if (!src)
+          src_path = 3; /* skip rather than paint foreign $1E36 */
       }
-      if (!src)
-        src_path = 3; /* skip rather than paint foreign $1E36 */
     }
   }
   if (layer == 0)
@@ -3557,14 +3593,22 @@ static void mw_present_rebuild_layer_strip(int layer, uint16_t cam_x,
         uint16_t live_t = 0;
         if (byte_off >= 0 && byte_off + 1 < 0x10000)
           live_t = mw_read7f16((uint16_t)byte_off);
-        if (!mw_bg1_tile_void(live_t))
+        if (!mw_bg1_tile_void(live_t)) {
           t = live_t;
-        else if (s_present_h2h_full_frame && use_snap && col >= 0)
-          continue; /* keep dual VRAM in native strip — do not blank */
-        else if (mw_bg1_tile_void(live_t) && col < 0)
-          continue; /* west still undecoded — leave miss/transparent */
-        else
+        } else if (col < 0) {
+          /* West gutter still undecoded — leave miss/transparent. */
+          continue;
+        } else if (s_present_h2h_full_frame) {
+          /*
+           * Do NOT keep prior VRAM. Dual $7F often has void for this
+           * column while the 32-row tilemap still holds the other cam's
+           * / prior-scroll brown (P1 low-Y wall → mid-screen band on
+           * P2). Sky is safer than a foreign ghost.
+           */
+          t = 0x0200u;
+        } else {
           t = live_t;
+        }
       }
       g_ppu->vram[vaddr & 0x7fffu] = t;
     }
@@ -3596,7 +3640,9 @@ static uint16_t mw_7f_off_from_world(uint16_t world_x, uint16_t world_y) {
 }
 
 /* Map world pixel to BG1 VRAM word for the present strip, or -1 if outside.
- * row_slop: ±1 for normal; larger for foreign-mover blank (trail ghosts). */
+ * row_slop: ±1 for normal; larger for foreign-mover blank (trail ghosts).
+ * X range matches rebuild ([-pad, view+1+pad)) so widescreen west cells
+ * of foreign brown are blankable too. */
 static int mw_bg1_world_to_vaddr_slop(uint16_t world_x, uint16_t world_y,
                                       uint16_t scroll_x, uint16_t scroll_y,
                                       int row_slop) {
@@ -3614,7 +3660,7 @@ static int mw_bg1_world_to_vaddr_slop(uint16_t world_x, uint16_t world_y,
   int pad = (g_ws_active && g_ws_extra > 0) ? mw_ws_tile_pad() : 0;
   if (pad < 0)
     pad = 0;
-  if (tx < -1 || tx >= view_cols + 1 + pad)
+  if (tx < -pad || tx >= view_cols + 1 + pad)
     return -1;
   if (ty < -row_slop || ty >= n_rows + row_slop)
     return -1;
@@ -3655,7 +3701,8 @@ static void mw_bg1_blank_world(uint16_t wx, uint16_t wy, uint16_t scroll_x,
   g_ppu->vram[(unsigned)va & 0x7fffu] = under;
 }
 
-/* Blank a tall/wide band around a world point (stripe + brown body). */
+/* Blank a tall/wide band around a world point (stripe + brown body).
+ * Pocket only — full-strip blank regressed stabilized map terrain. */
 static unsigned mw_prop_blank_band(int owx, int owy, uint16_t scroll_x,
                                    uint16_t scroll_y) {
   static const int kDx[7] = {-0x30, -0x20, -0x10, 0, 0x10, 0x20, 0x30};
@@ -4004,38 +4051,50 @@ static void mw_cam_oam_commit(unsigned src_off, uint16_t tile_attr) {
   if (src_off & 3u || src_off >= 128u * 4u)
     return;
 
+  const uint16_t y_meta_early = mw_wram16(0x0082u);
+  const uint16_t y_bank_early = mw_wram16(0x0084u);
+  const int shared_item_early =
+      mw_obj_is_shared_b1_item(s_draw_obj_latched) ||
+      (y_bank_early == 0x00B1u && mw_is_shared_b1_item_meta(y_meta_early));
+  const int b1_wide_early =
+      (y_bank_early == 0x00B1u && y_meta_early != 0 &&
+       y_meta_early != 0xD5B8u);
+  const int prop_cand_early =
+      mw_obj_is_stage_prop(s_draw_obj_latched) ||
+      s_pending_stage_prop_local_only ||
+      (y_bank_early == 0x00B1u && mw_is_stage_prop_meta(y_meta_early)) ||
+      b1_wide_early;
+
   int16_t sy;
+  int sy_from_obj = 0;
   if (s_pending_sy_valid) {
     sy = s_pending_sy;
     s_pending_sy_valid = 0;
   } else {
     /* Fallback: staging byte is biased. */
     const uint8_t y = g_ram[0x14C5u + src_off];
-    if (y >= 0xf0u)
-      return;
-    sy = (int16_t)((int)y - 0x78);
+    if (y >= 0xf0u) {
+      /* Parked $F0 — still capture movers/items from object world Y once
+       * cams + prop_obj are known (pending_sy miss used to drop them). */
+      if (!prop_cand_early && !shared_item_early)
+        return;
+      sy_from_obj = 1;
+      sy = 0;
+    } else {
+      sy = (int16_t)((int)y - 0x78);
+    }
   }
   /*
    * Vert-widen window is −144…#$E0 for gameplay. Stage props / shared $B1
-   * items may convert or sit at sy'≥$E0 — still capture so present can
-   * rebuild (movers: live +$02/+$04; items: multi-tile sticky + world
-   * present). Shared pickups often emit at sy≈−400 vs far dual cam —
-   * capture them anyway and store world meta offsets.
+   * items may convert or sit far off the half-frame — still capture so
+   * present can rebuild (movers: live +$02/+$04; items: multi-tile sticky).
+   * Movers above the dual cams (sy≈−300) need the same −512 floor as items.
    */
-  {
-    const uint16_t y_meta = mw_wram16(0x0082u);
-    const uint16_t y_bank = mw_wram16(0x0084u);
-    const int shared_item =
-        mw_obj_is_shared_b1_item(s_draw_obj_latched) ||
-        (y_bank == 0x00B1u && mw_is_shared_b1_item_meta(y_meta));
-    const int b1_wide =
-        (y_bank == 0x00B1u && y_meta != 0 && y_meta != 0xD5B8u);
-    const int prop_cand =
-        mw_obj_is_stage_prop(s_draw_obj_latched) ||
-        s_pending_stage_prop_local_only ||
-        (y_bank == 0x00B1u && mw_is_stage_prop_meta(y_meta)) || b1_wide;
-    const int y_lo = shared_item ? -512 : -144;
-    const int y_hi = (prop_cand || shared_item) ? 0x120 : 0xE0;
+  if (!sy_from_obj) {
+    const int y_lo =
+        (shared_item_early || prop_cand_early) ? -512 : -144;
+    const int y_hi =
+        (prop_cand_early || shared_item_early) ? 0x120 : 0xE0;
     if (sy < y_lo || sy >= y_hi)
       return;
   }
@@ -4143,6 +4202,22 @@ static void mw_cam_oam_commit(unsigned src_off, uint16_t tile_attr) {
       s_pending_stage_prop_local_only = 1;
       s_prop_stat_list_rec++;
     }
+  }
+  /*
+   * Staging Y was $F0 (no pending_sy): rebuild screen Y from object world
+   * vs the drawer cam so far-above / far-below movers still sticky-capture.
+   */
+  if (sy_from_obj) {
+    if (!mw_obj_is_stage_prop(prop_obj) && !mw_obj_is_shared_b1_item(prop_obj))
+      return;
+    const uint16_t owy = mw_wram16((uint16_t)(prop_obj + 4u));
+    const uint16_t dcy = draw_cam ? cam1y : cam0y;
+    sy = (int16_t)((int)owy - (int)dcy);
+    sy_i = (int)sy;
+    if (sy < -512 || sy >= 0x120)
+      return;
+    wx = (uint16_t)((int32_t)(draw_cam ? cam1x : cam0x) + sx_i);
+    wy = (uint16_t)((int32_t)dcy + sy_i);
   }
   if (local_only) {
     const int have_obj = mw_obj_is_stage_prop(prop_obj);
@@ -4864,7 +4939,10 @@ static int mw_present_oam_from_cam_capture(int local_slot, int extra,
     uint16_t idx = mw_wram16(0x1E14u);
     for (int guard = 0; guard < 64 && idx && kept < 128u; guard++) {
       const uint16_t next = mw_wram16((uint16_t)(idx + 0x14u));
-      if (mw_obj_is_stage_prop(idx) && (mw_wram16(idx) & 0x8000u) != 0) {
+      /* Keep sticky while the object remains a stage prop in the list.
+       * Object +$00 bit $8000 flickers on $C39E/$C6A4 every few frames;
+       * requiring it here wiped sn→0 and blanked the home peer. */
+      if (mw_obj_is_stage_prop(idx)) {
         const int ps = mw_prop_slot_for_obj(idx);
         /* Mark alive on every peer so foreign-home present does not wipe
          * the home peer's multi-tile sticky. */
@@ -4969,7 +5047,7 @@ static int mw_present_oam_from_cam_capture(int local_slot, int extra,
     uint16_t idx = mw_wram16(0x1E14u);
     for (int guard = 0; guard < 64 && idx && kept < 128u; guard++) {
       const uint16_t next = mw_wram16((uint16_t)(idx + 0x14u));
-      if (mw_obj_is_shared_b1_item(idx) && (mw_wram16(idx) & 0x8000u) != 0) {
+      if (mw_obj_is_shared_b1_item(idx)) {
         int s = -1;
         for (int i = 0; i < kMwItemStickyMax; i++) {
           if (s_item_sticky_valid[i] && s_item_sticky_obj[i] == idx) {

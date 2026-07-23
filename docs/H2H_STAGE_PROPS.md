@@ -112,10 +112,15 @@ Coldump: `sn`, `tiles[]`, `draw` (home∧sn∧active), `present.n` / `skip_own`.
 ### 4b. BG1 (brown body)
 
 - Shared `$7F` still carries every mover’s brown; local rebuild shows all of them.
-- After rebuild (+ after margin prefill): blank foreign movers at live `wx/wy`
-  and trail cell (`mw_prop_blank_band`).
-- Coldump: `bg_try`, `bg_hit` (0 hit when platform is far off the local strip
-  is expected — e.g. `sx≈1000`).
+- After rebuild (+ after margin prefill): pocket-blank foreign movers at live
+  `wx/wy` + trail (`mw_prop_blank_band`, ±X pocket — **not** full-strip).
+- **Src alignment (preferred fix for top-of-screen ghosts):** full-frame present
+  keeps `$42B3(scroll)` and must **not** replace it with dual sticky/live when
+  `y_bg=0` (that was `src=sticky`, peer mover dirt in local top rows). Drop
+  sticky / snap when not `same_column` as the local walk; cap snap col remap.
+- Void cells → sky `$0200` (no stale VRAM keep).
+- Coldump: object `sy == wy - cam_y` is already correct on ghost frames — treat
+  as strip/src phase, not object Y math.
 
 ---
 
@@ -188,10 +193,14 @@ after meta). Check `sx`/`sy` in coldump before assuming sticky failure.
 
 ## 8. Known gaps / open work
 
-1. `$C382` `$19F8` / `$1A4C` — active but `sn=0` (no sticky tiles).
-2. `$C382` `$1AF4` — sticky incomplete (single tile `$4E`).
-3. Foreign `bg_try=1` / `bg_hit=0` when off local strip — OK; on-screen misses
-   need blank-band / scroll key investigation.
+1. `$C382` upstairs (`$19F8` / `$1A4C` at wy≈106) — if the dual drawer never
+   emits OAM while both cams sit far below, sticky still cannot seed; Y capture
+   is widened (−512) and `$F0`-park recovery uses object world Y. Re-check after
+   scrolling those platforms on-screen.
+2. `$C382` multi-tile completeness (stripe + brown) — may still be 1 of N under
+   heavy OAM pressure; sticky accumulates across frames once seeded.
+3. Home props at `sy ≳ 224` still `skip_y` OAM (stripe) while BG1 brown remains —
+   visual “slab without stripe” on the home peer, not a cross-peer ghost.
 4. Widescreen DMA left pad clamps to 0 (VMADD col 0); left columns use shadow /
    `$7F` west fill — separate from mover OAM.
 5. Items (`$9FE2` etc.) use the shared-item sticky path; despawn sync is
@@ -203,4 +212,5 @@ after meta). Check `sx`/`sy` in coldump before assuming sticky failure.
 
 | Date | Note |
 |------|------|
+| 2026-07-23 | Revert full-strip blank (map regression). Ghost → src alignment: full-frame keep `$42B3(scroll)`, drop cross-column sticky/snap, cap snap d_cols. Sticky `$8000` wipe + Y−512 capture kept. |
 | 2026-07-22 | Initial doc from coldump deep ID + H2H mover work: whitelist vs items, nearer-mech home, multi-tile sticky, BG1 blank, elev-room catalog (`$C382`/`$C39E`/`$C6A4`). |
