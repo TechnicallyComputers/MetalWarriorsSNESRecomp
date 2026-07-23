@@ -493,7 +493,11 @@ static int LauncherNpMemberGet(void *ctx, int index,
   if (!snes_lobby_member_get(index, &member)) return 0;
   out->slot = member.slot;
   out->ready = member.ready;
-  out->is_host = member.slot == 0;
+  {
+    const char *host_id = snes_lobby_host_player_id();
+    out->is_host = host_id && host_id[0] &&
+                   strcmp(member.player_id, host_id) == 0;
+  }
   snprintf(out->display_name, sizeof(out->display_name), "%s",
            member.display_name);
   return 1;
@@ -507,7 +511,8 @@ static int LauncherNpMoveMember(void *ctx, int from_slot, int to_slot) {
       LauncherReadLanState(&state))
     return rnet_lan_lobby_set_host_slot(LauncherLanLobbyPath(),
                                         1 - state.host_slot);
-  return -1;
+  if (g_launcher_joined_lan) return -1;
+  return snes_lobby_move(from_slot, to_slot);
 }
 
 static int LauncherNpKickMember(void *ctx, int slot) {
@@ -1676,6 +1681,22 @@ int main(int argc, char** argv) {
 
   static int s_emu_session = 0;
 session_reboot:
+  /* Soft-return rematch: recomp-ui launcher_platform_close() calls SDL_Quit().
+   * Re-init before recreating the window/audio. First boot already inited
+   * above; skip when subsystems are still live. */
+  if (!SDL_WasInit(SDL_INIT_VIDEO) || !SDL_WasInit(SDL_INIT_AUDIO) ||
+      !SDL_WasInit(SDL_INIT_GAMECONTROLLER)) {
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) !=
+        0) {
+      host_report_breadcrumb("SDL_Init (session) FAILED: %s", SDL_GetError());
+      printf("Failed to init SDL: %s\n", SDL_GetError());
+      return 1;
+    }
+    host_report_breadcrumb(
+        "SDL session init ok: video=%s audio=%s",
+        SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : "(none)",
+        SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "(none)");
+  }
   /* Rematch after lobby soft-return re-enters here with updated netplay cfg. */
   {
     const int rematch_session = (++s_emu_session > 1);
@@ -2178,34 +2199,50 @@ error_reading:;
         rom_path_buf, sizeof(rom_path_buf));
     RecompLauncherCNetplayLaunch net = ls.netplay_launch;
 
-    if (lr == 0 && net.enabled) {
+    if (lr == 0) {
       ConfigFromLauncherSettings(&ls);
-      g_config.widescreen = 71;
+      if (net.enabled) {
+        g_config.widescreen = 71;
+        WriteConfigFile(config_file);
+        snes_netplay_config_defaults(&g_netplay_cfg);
+        g_netplay_cfg.enabled = 1;
+        g_netplay_cfg.local_slot = net.local_slot;
+        g_netplay_cfg.input_player =
+            (net.input_player == 0 || net.input_player == 1)
+                ? net.input_player : -1;
+        g_netplay_cfg.session_id = net.session_id ? net.session_id : 1u;
+        g_netplay_cfg.transport = 0;
+        snprintf(g_netplay_cfg.bind_hostport, sizeof(g_netplay_cfg.bind_hostport),
+                 "%s", net.bind_hostport);
+        snprintf(g_netplay_cfg.peer_hostport, sizeof(g_netplay_cfg.peer_hostport),
+                 "%s", net.peer_hostport);
+        snes_netplay_apply_env(&g_netplay_cfg);
+        if (net.input_delay >= 0 && net.input_delay <= 16)
+          g_netplay_cfg.input_delay = net.input_delay;
+        g_netplay_caps_ws_extra = 71;
+        g_netplay_pending = 1;
+        g_netplay_from_lobby = 1;
+        host_report_breadcrumb(
+            "launcher: rematch netplay slot=%d session=%u bind=%s "
+            "peer=%s delay=%d ws_extra=%d",
+            net.local_slot, (unsigned)net.session_id,
+            net.bind_hostport, net.peer_hostport, net.input_delay,
+            g_netplay_caps_ws_extra);
+        goto session_reboot;
+      }
+
+      /* Offline Play after soft-return — leave lobby and cold-boot solo. */
+      g_config.widescreen = 0;
       WriteConfigFile(config_file);
-      snes_netplay_config_defaults(&g_netplay_cfg);
-      g_netplay_cfg.enabled = 1;
-      g_netplay_cfg.local_slot = net.local_slot;
-      g_netplay_cfg.input_player =
-          (net.input_player == 0 || net.input_player == 1)
-              ? net.input_player : -1;
-      g_netplay_cfg.session_id = net.session_id ? net.session_id : 1u;
-      g_netplay_cfg.transport = 0;
-      snprintf(g_netplay_cfg.bind_hostport, sizeof(g_netplay_cfg.bind_hostport),
-               "%s", net.bind_hostport);
-      snprintf(g_netplay_cfg.peer_hostport, sizeof(g_netplay_cfg.peer_hostport),
-               "%s", net.peer_hostport);
-      snes_netplay_apply_env(&g_netplay_cfg);
-      if (net.input_delay >= 0 && net.input_delay <= 16)
-        g_netplay_cfg.input_delay = net.input_delay;
-      g_netplay_caps_ws_extra = 71;
-      g_netplay_pending = 1;
-      g_netplay_from_lobby = 1;
-      host_report_breadcrumb(
-          "launcher: rematch netplay slot=%d session=%u bind=%s "
-          "peer=%s delay=%d ws_extra=%d",
-          net.local_slot, (unsigned)net.session_id,
-          net.bind_hostport, net.peer_hostport, net.input_delay,
-          g_netplay_caps_ws_extra);
+      g_netplay_cfg.enabled = 0;
+      g_netplay_pending = 0;
+      g_netplay_from_lobby = 0;
+      if (g_launcher_hosting_lan || g_launcher_joined_lan)
+        (void)LauncherNpLeave(NULL);
+      snes_lobby_disconnect();
+      free(kRom);
+      kRom = NULL;
+      host_report_breadcrumb("launcher: offline launch after lobby");
       goto session_reboot;
     }
 
