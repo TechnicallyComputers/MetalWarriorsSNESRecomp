@@ -3,8 +3,8 @@
 Private playtest scaffold: static recompilation of *Metal Warriors* (SNES,
 USA) into native C using the [snesrecomp](https://github.com/mstan/snesrecomp)
 framework. The pre-boot launcher and netplay screens come from
-[recomp-ui](https://github.com/mstan/recomp-ui), vendored as
-`snesrecomp/lib/recomp-ui`.
+[recomp-ui](https://github.com/mstan/recomp-ui), vendored as a **repo-root**
+submodule (`./recomp-ui`). snesrecomp keeps only `lib/recomp-net`.
 
 This repo is **not** a public release. The ROM is never redistributed; supply
 your own legally dumped copy.
@@ -23,12 +23,12 @@ hashing.
 
 ## Source setup
 
-The game needs a snesrecomp checkout (default `./snesrecomp`, clone or symlink).
-Initialize snesrecomp's submodules (`lib/recomp-ui`, `lib/recomp-net`) after
-cloning:
+The game needs a snesrecomp checkout (default `./snesrecomp`, clone or symlink)
+and the repo-root `recomp-ui` submodule. Initialize both after cloning:
 
 ```bash
-git -C snesrecomp submodule update --init --recursive
+git submodule update --init --recursive
+git -C snesrecomp submodule update --init --recursive   # lib/recomp-net
 ```
 
 To build against a feature worktree instead, set `SNESRECOMP_ROOT` explicitly:
@@ -132,9 +132,9 @@ normal interactive session.
 - `recomp/` - bank `.cfg` seeds and `funcs.h` (synced by regeneration)
 - `src/` - game glue, runtime integration, configuration, and generated stubs
 - `src/gen/` - recompiler output (local only; gitignored)
+- `recomp-ui/` - Dear ImGui launcher submodule (game-owned pin)
 - `snesrecomp/` - default framework checkout or symlink (includes
-  `lib/recomp-ui` + `lib/recomp-net`); override with `SNESRECOMP_ROOT`
-  when using a worktree
+  `lib/recomp-net`); override with `SNESRECOMP_ROOT` when using a worktree
 - `tools/regen.sh` and `tools/build-linux.sh` - regeneration and Linux build
 - `docs/H2H_STAGE_PROPS.md` - H2H mover/platform identification & manipulation
   (coldump fields, meta whitelist, OAM sticky + BG1 brown)

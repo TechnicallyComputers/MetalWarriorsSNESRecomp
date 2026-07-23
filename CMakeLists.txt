@@ -114,9 +114,17 @@ if(WIN32)
     target_link_libraries(MetalWarriorsSNESRecomp PRIVATE ws2_32 dbghelp)
 endif()
 
-# Shared Dear ImGui pre-boot launcher from snesrecomp's lib/recomp-ui submodule.
+# Shared Dear ImGui pre-boot launcher — game-root recomp-ui submodule.
 # Presentation only; lobby/netcode are supplied through callbacks in main.c.
-snesrecomp_enable_launcher_ui(MetalWarriorsSNESRecomp)
+set(RECOMP_UI_ROOT "${CMAKE_SOURCE_DIR}/recomp-ui" CACHE PATH
+    "Root directory of the recomp-ui launcher repo" FORCE)
+if(NOT EXISTS "${RECOMP_UI_ROOT}/recomp_ui.cmake")
+    message(FATAL_ERROR
+        "recomp-ui missing at ${RECOMP_UI_ROOT}.\n"
+        "Run: git submodule update --init --recursive recomp-ui")
+endif()
+include(${RECOMP_UI_ROOT}/recomp_ui.cmake)
+recomp_target_launcher_ui(MetalWarriorsSNESRecomp)
 
 # Delay-sync netplay + MotK lobby client (LAN by default; opt into ICE with
 # -DSNESRECOMP_NET_ICE=ON when libjuice is available).
