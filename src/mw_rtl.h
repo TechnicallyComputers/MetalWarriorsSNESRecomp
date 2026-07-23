@@ -10,7 +10,8 @@ void MwDrawPpuFrame(void);
 
 /* Present-only: full 224-line framebuffer from one H2H camera (local slot
  * 0 = P1 / $1E2E,$1E5E; 1 = P2 / $1E32,$1E62). Default ON for netplay.
- * Opt out: SNESRECOMP_MW_H2H_FULL_FRAME=0 (legacy half-crop). */
+ * Opt out: SNESRECOMP_MW_H2H_FULL_FRAME=0 (legacy half-crop).
+ * Column/mover offline dump: SNESRECOMP_MW_COLDUMP=path.jsonl (or =1). */
 void MwDrawPpuFrameLocalFull(int local_slot);
 bool MwH2hFullFrameLocalArmed(void);
 

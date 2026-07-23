@@ -66,6 +66,11 @@ enum { kMwWidenAfterWriteEnabled = 1 };
 enum { kMwDmaWidenEnabled = 1 };
 /* Set SNESRECOMP_MW_COLS=1 to log unique leading tile-column depth. */
 enum { kMwUniqueColLogEnabled = 0 };
+/*
+ * SNESRECOMP_MW_COLDUMP=<path.jsonl> (or =1 → ./mw_coldump.jsonl):
+ * compact one-line JSON records for offline column / mover analysis.
+ * Prefer this over stderr — elev/COLS dumps overflow CLI scrollback.
+ */
 
 /* Native DASIZ and STA $4305 sites (LDA #$0022 is the prior opcode). */
 enum {
@@ -80,10 +85,440 @@ static void mw_latch_nmi_camera(void);
 static void mw_elev_dump(void);
 static unsigned mw_ws_extra_u(void);
 static int mw_h2h_vert_widen_armed(void);
+static uint16_t mw_wram16(uint16_t addr);
 static unsigned s_tile7f_hits;
 static unsigned s_tile_helper_hits;
-/* $00B1 pillar draw → cam-capture local-only (see s_cam_local_only). */
-static int s_pending_b1_local_only;
+/* Whitelisted $00B1 movers → cam-capture local-only (skip reproject).
+ * Latch at drawer STA $86 (X=object) for the whole sprite; post-meta must not
+ * clear on a bad intermediate X. Shared $B1 items are mirrored into both cam
+ * buffers instead (not local_only). 1P: $808714/$808721; H2H dual: $8087DE/
+ * $808802/$80881F. Commit recovers list object via $96→$136E,Y. */
+static int s_pending_stage_prop_local_only;
+static uint16_t s_draw_obj_latched;
+/* Armed at latch; cleared after first commit purges prior tiles for this obj. */
+static uint16_t s_prop_purge_arm;
+/* Lifetime counters for SNESRECOMP_MW_ELEV (non-saturating). */
+static unsigned s_prop_stat_latch;
+static unsigned s_prop_stat_list_rec;
+static unsigned s_prop_stat_commit;
+static unsigned s_prop_stat_convert;
+/* Peak meta tile-count ($7E) seen while a stage prop is pending (elev). */
+static unsigned s_prop_stat_meta7e_max;
+/* Snapshot at present — elev dump may run after OAM clear zeros live buffers. */
+static unsigned s_elev_cap_n0, s_elev_cap_n1;
+static unsigned s_elev_cap_lo0, s_elev_cap_lo1;
+/* Elev: last full-frame BG1 src path (0=none 1=42b3 2=raw_walk 3=skip_p1 4=legacy). */
+static int s_elev_bg1_src_path;
+/* Elev: count of foreign stage props blanked from local BG1 this present. */
+static int s_elev_prop_bg_dy;
+
+/* Last DMA-widen + present stats for SNESRECOMP_MW_COLDUMP JSONL. */
+static int s_coldump_pad_l, s_coldump_pad_r;
+static uint16_t s_coldump_dasiz, s_coldump_aadr0, s_coldump_aadr1;
+static uint16_t s_coldump_vm0, s_coldump_vm1;
+static uint32_t s_coldump_dma_pc;
+static int s_coldump_dma_frame = -1;
+static int s_coldump_dma_dirty;
+static unsigned s_coldump_prop_n, s_coldump_prop_raw;
+static unsigned s_coldump_skip_own, s_coldump_skip_y;
+static int s_coldump_present_slot = -1;
+static int s_coldump_present_frame = -1;
+/* Per-prop BG1 blank results from last present align (foreign hide). */
+static uint16_t s_coldump_bg_obj[24];
+static uint16_t s_coldump_bg_hit[24];
+static uint8_t s_coldump_bg_try[24];
+static int s_coldump_bg_slot = -1;
+/* Motion trail for coldump Δwx/Δwy. */
+static uint16_t s_coldump_mot_obj[24];
+static uint16_t s_coldump_mot_wx[24];
+static uint16_t s_coldump_mot_wy[24];
+static uint8_t s_coldump_mot_valid[24];
+static unsigned s_lle_host_frames; /* also used by LLE session / coldump */
+static void mw_coldump_tick(int local_slot);
+/* Defined with cam-capture buffers below; elev dump prefers present snapshot. */
+static unsigned s_cam_n[2];
+static uint8_t s_cam_local_only[2][128];
+/* 1 = shared $B1 item tile — present via multi-tile sticky only (not raw). */
+static uint8_t s_cam_shared_item[2][128];
+/* Per tile: -1 = shared stage prop; 0/1 = dual-slot owner (object +$06 hi). */
+static int8_t s_cam_prop_owner[2][128];
+
+/*
+ * Present-only: bank-$B1 *movers* that need per-peer home isolation.
+ * Whitelist only — a bare `meta≠0 && meta≠$D5B8` tagged pickups/items
+ * (e.g. `$9FE2` crates) as local_only; nearer-mech home then permanently
+ * culled them on the non-home peer (same class of bug as mech OAM cull).
+ * Elevators `$D5B8` stay out (BG2 path). Add metas here when a new mover
+ * needs isolation.
+ */
+static int mw_is_stage_prop_meta(uint16_t meta) {
+  switch (meta) {
+  case 0xC382u: /* hazard stripe + brown body */
+  case 0xC39Eu:
+  case 0xC6A4u:
+  case 0xC400u:
+  case 0xC5F2u:
+  case 0xC3ECu:
+  case 0xC3C4u:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+/* Bank-$B1 pickups/items: shared world OAM (not home-isolated movers). */
+static int mw_is_shared_b1_item_meta(uint16_t meta) {
+  return meta != 0 && meta != 0xD5B8u && !mw_is_stage_prop_meta(meta);
+}
+
+static int mw_obj_is_stage_prop(uint16_t obj) {
+  if (obj < 0x1934u || obj >= 0x2000u)
+    return 0;
+  return mw_wram16((uint16_t)(obj + 0xAu)) == 0x00B1u &&
+         mw_is_stage_prop_meta(mw_wram16((uint16_t)(obj + 8u)));
+}
+
+/*
+ * Dual-viewport slot on object +$06 — hi-byte only (mechs / some plates):
+ *   $01xx → cam0, $02xx → cam1. -1 = no hi-byte tag.
+ * Low-byte tags ($0002/$0004/$0008 on $C382 movers) are NOT viewport owners.
+ */
+static int mw_obj_stage_prop_owner(uint16_t obj) {
+  if (obj < 0x1934u || obj >= 0x2000u)
+    return -1;
+  const uint16_t t = mw_wram16((uint16_t)(obj + 6u));
+  if ((t & 0xFF00u) == 0x0100u)
+    return 0;
+  if ((t & 0xFF00u) == 0x0200u)
+    return 1;
+  return -1;
+}
+
+/*
+ * Home cam for stage props.
+ * Hi-byte +$06 ($01xx/$02xx) is authoritative and sticky.
+ * Lo-byte-only movers ($0002/$0004/$0006/$0008): nearer dual-slot mech each
+ * frame. Forever-latch from a one-shot nearer-cam / single-mech guess was
+ * wrong — playtest `$1AD8` @`$045E` (+$06=$0006) latched owner=0 and
+ * converted into cam0 (P1 ghost / P2 empty sky). No camera-center fallback:
+ * return -1 until a mech exists (present/BG1 suppress until then).
+ * Soft hysteresis when both mechs exist keeps fly edges from thrashing.
+ */
+enum { kMwPropHomeMax = 24 };
+static uint16_t s_prop_home_obj[kMwPropHomeMax];
+static int8_t s_prop_home_cam[kMwPropHomeMax];
+/* Last world pos per stage prop — blank trails when movers leave a peer. */
+static uint16_t s_prop_trail_obj[kMwPropHomeMax];
+static uint16_t s_prop_trail_wx[kMwPropHomeMax];
+static uint16_t s_prop_trail_wy[kMwPropHomeMax];
+static uint8_t s_prop_trail_valid[kMwPropHomeMax];
+/*
+ * Multi-tile sticky for home-isolated movers ($C382 etc). Dual-drawer OAM
+ * pressure often keeps only 1 of N meta tiles per frame — single-tile sticky
+ * permanently half-culled the sprite, and present skipped sticky once any raw
+ * tile placed. Accumulate tiles (tile id + meta ox/oy) across frames; present
+ * places the full set for the home peer only.
+ */
+enum { kMwPropStickyTiles = 8 };
+static uint16_t s_prop_sticky_obj[kMwPropHomeMax];
+static uint8_t s_prop_sticky_n[kMwPropHomeMax];
+static uint8_t s_prop_sticky_spr[kMwPropHomeMax][kMwPropStickyTiles][4];
+static uint8_t s_prop_sticky_sz[kMwPropHomeMax][kMwPropStickyTiles];
+static int16_t s_prop_sticky_mox[kMwPropHomeMax][kMwPropStickyTiles];
+static int16_t s_prop_sticky_moy[kMwPropHomeMax][kMwPropStickyTiles];
+static uint8_t s_prop_sticky_valid[kMwPropHomeMax];
+
+static void mw_prop_home_reset(void) {
+  memset(s_prop_home_obj, 0, sizeof(s_prop_home_obj));
+  memset(s_prop_home_cam, -1, sizeof(s_prop_home_cam));
+  memset(s_prop_trail_obj, 0, sizeof(s_prop_trail_obj));
+  memset(s_prop_trail_valid, 0, sizeof(s_prop_trail_valid));
+  memset(s_prop_sticky_obj, 0, sizeof(s_prop_sticky_obj));
+  memset(s_prop_sticky_n, 0, sizeof(s_prop_sticky_n));
+  memset(s_prop_sticky_valid, 0, sizeof(s_prop_sticky_valid));
+}
+
+static int mw_prop_slot_for_obj(uint16_t obj) {
+  int free_i = -1;
+  for (int i = 0; i < kMwPropHomeMax; i++) {
+    if (s_prop_trail_obj[i] == obj || s_prop_sticky_obj[i] == obj)
+      return i;
+    if (free_i < 0 && !s_prop_trail_obj[i] && !s_prop_sticky_obj[i])
+      free_i = i;
+  }
+  if (free_i >= 0)
+    return free_i;
+  return (int)((obj - 0x1934u) / 0x1Cu) % kMwPropHomeMax;
+}
+
+static void mw_prop_sticky_store(uint16_t obj, const uint8_t spr[4], uint8_t sz,
+                                 int16_t mox, int16_t moy) {
+  if (obj < 0x1934u || obj >= 0x2000u || !spr)
+    return;
+  const int s = mw_prop_slot_for_obj(obj);
+  if (!s_prop_sticky_valid[s] || s_prop_sticky_obj[s] != obj) {
+    s_prop_sticky_obj[s] = obj;
+    s_prop_sticky_n[s] = 0;
+    s_prop_sticky_valid[s] = 1;
+  }
+  for (unsigned i = 0; i < s_prop_sticky_n[s]; i++) {
+    if (s_prop_sticky_spr[s][i][2] != spr[2])
+      continue;
+    const int dx = (int)s_prop_sticky_mox[s][i] - (int)mox;
+    const int dy = (int)s_prop_sticky_moy[s][i] - (int)moy;
+    if (dx <= 1 && dx >= -1 && dy <= 1 && dy >= -1) {
+      memcpy(s_prop_sticky_spr[s][i], spr, 4);
+      s_prop_sticky_sz[s][i] = sz;
+      s_prop_sticky_mox[s][i] = mox;
+      s_prop_sticky_moy[s][i] = moy;
+      return;
+    }
+  }
+  if (s_prop_sticky_n[s] >= kMwPropStickyTiles)
+    return;
+  const unsigned d = s_prop_sticky_n[s]++;
+  memcpy(s_prop_sticky_spr[s][d], spr, 4);
+  s_prop_sticky_sz[s][d] = sz;
+  s_prop_sticky_mox[s][d] = mox;
+  s_prop_sticky_moy[s][d] = moy;
+}
+
+/*
+ * Shared bank-$B1 pickups/items (e.g. $9FE2): multi-tile sticky so dual-drawer
+ * OAM pressure cannot leave a permanently half-culled sprite. Tiles are stored
+ * with world meta offsets; present places the full set for BOTH peers from
+ * live +$02/+$04 (not home-isolated).
+ */
+enum { kMwItemStickyMax = 16, kMwItemStickyTiles = 8 };
+static uint16_t s_item_sticky_obj[kMwItemStickyMax];
+static uint8_t s_item_sticky_n[kMwItemStickyMax];
+static uint8_t s_item_sticky_spr[kMwItemStickyMax][kMwItemStickyTiles][4];
+static uint8_t s_item_sticky_sz[kMwItemStickyMax][kMwItemStickyTiles];
+static int16_t s_item_sticky_mox[kMwItemStickyMax][kMwItemStickyTiles];
+static int16_t s_item_sticky_moy[kMwItemStickyMax][kMwItemStickyTiles];
+static uint8_t s_item_sticky_valid[kMwItemStickyMax];
+
+static void mw_item_sticky_reset(void) {
+  memset(s_item_sticky_obj, 0, sizeof(s_item_sticky_obj));
+  memset(s_item_sticky_n, 0, sizeof(s_item_sticky_n));
+  memset(s_item_sticky_valid, 0, sizeof(s_item_sticky_valid));
+}
+
+static int mw_item_sticky_slot(uint16_t obj) {
+  int free_i = -1;
+  for (int i = 0; i < kMwItemStickyMax; i++) {
+    if (s_item_sticky_valid[i] && s_item_sticky_obj[i] == obj)
+      return i;
+    if (free_i < 0 && !s_item_sticky_valid[i])
+      free_i = i;
+  }
+  if (free_i >= 0)
+    return free_i;
+  return (int)((obj - 0x1934u) / 0x1Cu) % kMwItemStickyMax;
+}
+
+static void mw_item_sticky_store(uint16_t obj, const uint8_t spr[4], uint8_t sz,
+                                 int16_t mox, int16_t moy) {
+  if (obj < 0x1934u || obj >= 0x2000u || !spr)
+    return;
+  const int s = mw_item_sticky_slot(obj);
+  if (!s_item_sticky_valid[s] || s_item_sticky_obj[s] != obj) {
+    s_item_sticky_obj[s] = obj;
+    s_item_sticky_n[s] = 0;
+    s_item_sticky_valid[s] = 1;
+  }
+  for (unsigned i = 0; i < s_item_sticky_n[s]; i++) {
+    if (s_item_sticky_spr[s][i][2] != spr[2])
+      continue;
+    const int dx = (int)s_item_sticky_mox[s][i] - (int)mox;
+    const int dy = (int)s_item_sticky_moy[s][i] - (int)moy;
+    if (dx <= 1 && dx >= -1 && dy <= 1 && dy >= -1) {
+      memcpy(s_item_sticky_spr[s][i], spr, 4);
+      s_item_sticky_sz[s][i] = sz;
+      s_item_sticky_mox[s][i] = mox;
+      s_item_sticky_moy[s][i] = moy;
+      return;
+    }
+  }
+  if (s_item_sticky_n[s] >= kMwItemStickyTiles)
+    return;
+  const unsigned d = s_item_sticky_n[s]++;
+  memcpy(s_item_sticky_spr[s][d], spr, 4);
+  s_item_sticky_sz[s][d] = sz;
+  s_item_sticky_mox[s][d] = mox;
+  s_item_sticky_moy[s][d] = moy;
+}
+
+static int mw_obj_is_shared_b1_item(uint16_t obj) {
+  if (obj < 0x1934u || obj >= 0x2000u)
+    return 0;
+  if (mw_wram16((uint16_t)(obj + 0xAu)) != 0x00B1u)
+    return 0;
+  return mw_is_shared_b1_item_meta(mw_wram16((uint16_t)(obj + 8u)));
+}
+
+/* Find world X/Y of the dual-slot mech (hi-byte +$06). 0 if missing. */
+static int mw_find_dual_mech_xy(int slot, int *ox, int *oy) {
+  const uint16_t want = (slot == 1) ? 0x0200u : 0x0100u;
+  uint16_t idx = mw_wram16(0x1E14u);
+  for (int guard = 0; guard < 64 && idx; guard++) {
+    const uint16_t fl = mw_wram16(idx);
+    const uint16_t t6 = mw_wram16((uint16_t)(idx + 6u));
+    const uint16_t next = mw_wram16((uint16_t)(idx + 0x14u));
+    if ((fl & 0x8000u) && (t6 & 0xFF00u) == want) {
+      if (ox)
+        *ox = (int)mw_wram16((uint16_t)(idx + 2u));
+      if (oy)
+        *oy = (int)mw_wram16((uint16_t)(idx + 4u));
+      return 1;
+    }
+    if (next == 0 || next == idx)
+      break;
+    idx = next;
+  }
+  return 0;
+}
+
+/* Store / update soft home hint for hysteresis. */
+static void mw_prop_home_store(uint16_t obj, int spat) {
+  int slot = -1;
+  for (int i = 0; i < kMwPropHomeMax; i++) {
+    if (s_prop_home_obj[i] == obj) {
+      slot = i;
+      break;
+    }
+    if (slot < 0 && !s_prop_home_obj[i])
+      slot = i;
+  }
+  if (slot < 0)
+    slot = (int)((obj - 0x1934u) / 0x1Cu) % kMwPropHomeMax;
+  s_prop_home_obj[slot] = obj;
+  s_prop_home_cam[slot] = (int8_t)spat;
+}
+
+static int mw_prop_home_lookup(uint16_t obj) {
+  for (int i = 0; i < kMwPropHomeMax; i++) {
+    if (s_prop_home_obj[i] == obj)
+      return (int)s_prop_home_cam[i];
+  }
+  return -1;
+}
+
+static int mw_stage_prop_home_cam(uint16_t obj, uint16_t cam0x, uint16_t cam0y,
+                                  uint16_t cam1x, uint16_t cam1y) {
+  (void)cam0x;
+  (void)cam0y;
+  (void)cam1x;
+  (void)cam1y;
+  const int tagged = mw_obj_stage_prop_owner(obj);
+  if (tagged >= 0)
+    return tagged;
+  if (obj < 0x1934u || obj >= 0x2000u)
+    return -1;
+
+  int mx0 = 0, my0 = 0, mx1 = 0, my1 = 0;
+  const int have0 = mw_find_dual_mech_xy(0, &mx0, &my0);
+  const int have1 = mw_find_dual_mech_xy(1, &mx1, &my1);
+  if (!have0 && !have1)
+    return -1;
+
+  const int owx = (int)mw_wram16((uint16_t)(obj + 2u));
+  const int owy = (int)mw_wram16((uint16_t)(obj + 4u));
+  int spat;
+  int32_t d0 = 0, d1 = 0;
+  if (have0 && have1) {
+    const int32_t ax0 = (int32_t)owx - mx0;
+    const int32_t ay0 = (int32_t)owy - my0;
+    const int32_t ax1 = (int32_t)owx - mx1;
+    const int32_t ay1 = (int32_t)owy - my1;
+    d0 = ax0 * ax0 + ay0 * ay0;
+    d1 = ax1 * ax1 + ay1 * ay1;
+    spat = (d1 < d0) ? 1 : 0;
+  } else if (have1) {
+    spat = 1;
+  } else {
+    spat = 0;
+  }
+
+  const int cur = mw_prop_home_lookup(obj);
+  if (cur < 0) {
+    mw_prop_home_store(obj, spat);
+    return spat;
+  }
+  /* Single-mech guess may be wrong once the other appears — allow fix. */
+  if (!(have0 && have1)) {
+    if (cur != spat)
+      mw_prop_home_store(obj, spat);
+    return spat;
+  }
+  /*
+   * Both mechs: keep cur unless the other is clearly nearer (4×). Stops
+   * fly-edge thrash while still correcting a wrong early latch (P2 prop
+   * stuck on cam0).
+   */
+  if (cur == spat)
+    return cur;
+  const int32_t d_cur = (cur == 0) ? d0 : d1;
+  const int32_t d_new = (spat == 0) ? d0 : d1;
+  if (d_new * 4 < d_cur) {
+    mw_prop_home_store(obj, spat);
+    return spat;
+  }
+  return cur;
+}
+
+/* Dual drawer list index $96 → object at $136E,Y (word table). */
+static uint16_t mw_dual_draw_list_obj(void) {
+  const uint16_t yi = mw_wram16(0x0096u);
+  if (yi >= 0x80u || (yi & 1u))
+    return 0;
+  const uint16_t obj = mw_wram16((uint16_t)(0x136Eu + yi));
+  if (obj < 0x1934u || obj >= 0x2000u)
+    return 0;
+  return obj;
+}
+
+static void mw_latch_stage_prop_obj(uint16_t obj) {
+  if (mw_obj_is_stage_prop(obj)) {
+    if (!s_pending_stage_prop_local_only)
+      s_prop_stat_latch++;
+    s_pending_stage_prop_local_only = 1;
+    s_draw_obj_latched = obj;
+    /* New sprite pass — next commit replaces any prior tiles for this obj. */
+    s_prop_purge_arm = obj;
+    return;
+  }
+  /* Confirmed object that isn't a stage prop → new sprite, clear.
+   * Garbage / mid-sprite X: keep pending so multi-tile metas stay tagged. */
+  if (obj >= 0x1934u && obj < 0x2000u) {
+    s_pending_stage_prop_local_only = 0;
+    s_draw_obj_latched = obj;
+    s_prop_purge_arm = 0;
+  }
+}
+
+/* Dual $80882F: LDA $00,X before TAX←flags&6 — reinforce only, never clear.
+ * $7E (meta tile count) is already stored by the prior LDA [$82]/STA $7E. */
+static void mw_draw_prop_reinforce_hook(CpuState *cpu, uint32_t pc24) {
+  (void)pc24;
+  if (!MwIsDualViewport() || !mw_h2h_vert_widen_armed())
+    return;
+  const uint16_t obj = (uint16_t)cpu->X;
+  if (mw_obj_is_stage_prop(obj)) {
+    /* Do not re-arm purge mid-sprite — that would drop tiles already committed. */
+    if (!s_pending_stage_prop_local_only || s_draw_obj_latched != obj)
+      s_prop_purge_arm = obj;
+    if (!s_pending_stage_prop_local_only)
+      s_prop_stat_latch++;
+    s_pending_stage_prop_local_only = 1;
+    s_draw_obj_latched = obj;
+  }
+  if (s_pending_stage_prop_local_only) {
+    const unsigned n = (unsigned)mw_wram16(0x007Eu);
+    if (n > s_prop_stat_meta7e_max)
+      s_prop_stat_meta7e_max = n;
+  }
+}
 
 /* Read a 16-bit CPU vector from bank $00 (emulation/native vector table). */
 static uint32_t mw_read_vector_pc24(uint16_t vec_addr) {
@@ -740,8 +1175,11 @@ static void mw_active_lo_hook(CpuState *cpu, uint32_t pc24) {
   }
 }
 
-/* After screen-X → $86 in the active-list meta-sprite drawer ($808714). */
+/* After screen-X → $86 (1P $808704/$808714; dual $8087DE/$808802).
+ * X is the object — latch stage-prop ownership for all tiles of this sprite. */
 static void mw_draw_sx_hook(CpuState *cpu, uint32_t pc24) {
+  if (MwIsDualViewport() && mw_h2h_vert_widen_armed())
+    mw_latch_stage_prop_obj((uint16_t)cpu->X);
   if (!mw_ws_entity_hooks_armed())
     return;
   const int16_t sx = (int16_t)cpu->A;
@@ -752,23 +1190,32 @@ static void mw_draw_sx_hook(CpuState *cpu, uint32_t pc24) {
       const int16_t sy = (int16_t)mw_wram16(0x0088);
       logs++;
       fprintf(stderr,
-              "[mw_draw] sx=%d sy=%d pc=$%06X obj=%04X flags=%04X\n",
+              "[mw_draw] sx=%d sy=%d pc=$%06X obj=%04X flags=%04X prop=%d\n",
               (int)sx, (int)sy, (unsigned)pc24, (unsigned)cpu->X,
-              (unsigned)mw_wram16((uint16_t)cpu->X));
+              (unsigned)mw_wram16((uint16_t)cpu->X),
+              s_pending_stage_prop_local_only);
     }
   }
 }
 
-/* After JSR $8759 returns ($808721) — $82/$84 are the meta-sprite pointer.
- * X still holds the object. Tag $00B1 pillars for per-cam present ownership. */
+/* After meta resolve returns (1P $808721 post-$8759; dual $80881F post-$8857)
+ * — $82/$84 are the meta-sprite pointer. Only reinforce stage-prop latch;
+ * never clear it here (a mid-sprite non-prop X used to drop tags so only a
+ * few tiles stayed local_only / world-presented). Cleared at next STA $86. */
 static void mw_draw_meta_hook(CpuState *cpu, uint32_t pc24) {
   (void)pc24;
-  s_pending_b1_local_only = 0;
+  const uint16_t p_lo = mw_wram16(0x0082);
+  const uint16_t p_hi = mw_wram16(0x0084);
   if (MwIsDualViewport() && mw_h2h_vert_widen_armed()) {
     const uint16_t obj = (uint16_t)cpu->X;
-    if (obj >= 0x1934u && obj < 0x2000u &&
-        mw_wram16((uint16_t)(obj + 0xAu)) == 0x00B1u)
-      s_pending_b1_local_only = 1;
+    if (mw_obj_is_stage_prop(obj)) {
+      s_draw_obj_latched = obj;
+      s_pending_stage_prop_local_only = 1;
+    } else if (p_hi == 0x00B1u && mw_is_stage_prop_meta(p_lo)) {
+      s_pending_stage_prop_local_only = 1;
+      /* keep s_draw_obj_latched from STA $86 */
+    }
+    /* else: keep s_pending / latched object for the rest of this sprite */
   }
   if (!mw_ws_entity_hooks_armed())
     return;
@@ -777,14 +1224,14 @@ static void mw_draw_meta_hook(CpuState *cpu, uint32_t pc24) {
   const int extra = (int)mw_ws_extra_u();
   if (sx < -64 - extra - 48 || sx >= 256 + extra)
     return;
-  const uint16_t p_lo = mw_wram16(0x0082);
-  const uint16_t p_hi = mw_wram16(0x0084);
   static unsigned logs;
   if (logs < 20 && getenv("SNESRECOMP_MW_COLS")) {
     logs++;
-    fprintf(stderr, "[mw_draw] meta sx=%d sy=%d ptr=%04X/%04X %s b1=%d\n",
+    fprintf(stderr,
+            "[mw_draw] meta sx=%d sy=%d ptr=%04X/%04X %s prop=%d obj=%04X\n",
             (int)sx, (int)sy, (unsigned)p_lo, (unsigned)p_hi,
-            (p_lo | p_hi) ? "ok" : "NULL-skip", s_pending_b1_local_only);
+            (p_lo | p_hi) ? "ok" : "NULL-skip",
+            s_pending_stage_prop_local_only, (unsigned)s_draw_obj_latched);
   }
 }
 
@@ -935,41 +1382,9 @@ static void mw_obj_onscreen_cmp_hook(CpuState *cpu, uint32_t pc24) {
   }
 }
 
-/* Nearer dual cam for world (x,y). */
-static int mw_dual_nearer_cam(uint16_t wx, uint16_t wy) {
-  const uint16_t c0x = mw_wram16(0x1E16u);
-  const uint16_t c0y = mw_wram16(0x1E18u);
-  const uint16_t c1x = mw_wram16(0x1E1Au);
-  const uint16_t c1y = mw_wram16(0x1E1Cu);
-  const int d0x = (int)wx - (int)c0x;
-  const int d0y = (int)wy - (int)c0y;
-  const int d1x = (int)wx - (int)c1x;
-  const int d1y = (int)wy - (int)c1y;
-  const unsigned a0 =
-      (unsigned)((d0x < 0 ? -d0x : d0x) + (d0y < 0 ? -d0y : d0y));
-  const unsigned a1 =
-      (unsigned)((d1x < 0 ? -d1x : d1x) + (d1y < 0 ? -d1y : d1y));
-  return (a1 < a0) ? 1 : 0;
-}
-
-/* Active $00B1 at world X/Y (bbox regs), or 0. */
-static uint16_t mw_find_b1_obj_at(uint16_t wx, uint16_t wy) {
-  uint16_t idx = mw_wram16(0x1E14u);
-  for (int guard = 0; guard < 64 && idx; guard++) {
-    const uint16_t fl = mw_wram16(idx);
-    const uint16_t next = mw_wram16((uint16_t)(idx + 0x14u));
-    if ((fl & 0x8000u) && mw_wram16((uint16_t)(idx + 0xAu)) == 0x00B1u &&
-        mw_wram16((uint16_t)(idx + 2u)) == wx &&
-        mw_wram16((uint16_t)(idx + 4u)) == wy)
-      return idx;
-    if (next == 0 || next == idx)
-      break;
-    idx = next;
-  }
-  return 0;
-}
-
-/* $809A31 — STA $7F0000,X used by doors/platforms (entry $809A18). */
+/* $809A31 — STA $7F0000,X used by doors/platforms (entry $809A18).
+ * Dest is world-absolute via 42B3[(Y&~15)>>3]+((X&~15)>>3); X/Y are the
+ * pixel args (hook sees computed $7F offset in cpu->X). */
 static void mw_tile_patch_hook(CpuState *cpu, uint32_t pc24) {
   (void)pc24;
   if (!mw_ws_entity_hooks_armed())
@@ -982,39 +1397,6 @@ static void mw_tile_patch_hook(CpuState *cpu, uint32_t pc24) {
             s_tile7f_hits, (unsigned)cpu->A, (unsigned)cpu->X,
             (unsigned)mw_wram16(0x1E16));
   }
-}
-
-/*
- * $82837B dual bbox OR: $00B1 pillars update for either cam and thrash
- * shared $7F / state. Restrict success to the nearer cam only.
- *  $838D BCC → success via cam0: suppress if B1 nearer cam1
- *  $83A6 BCS → fail cam1 Y: force fail if B1 nearer cam0 (block cam1 success)
- */
-static void mw_b1_bbox_cam0_success_hook(CpuState *cpu, uint32_t pc24) {
-  (void)pc24;
-  if (!MwIsDualViewport() || !mw_h2h_vert_widen_armed())
-    return;
-  /* BCC about to succeed when C=0. */
-  if (cpu->_flag_C)
-    return;
-  const uint16_t wx = (uint16_t)cpu->X;
-  const uint16_t wy = (uint16_t)cpu->Y;
-  if (!mw_find_b1_obj_at(wx, wy))
-    return;
-  if (mw_dual_nearer_cam(wx, wy) == 1)
-    cpu->_flag_C = 1; /* fall into dual check / fail — not cam0-owned */
-}
-
-static void mw_b1_bbox_cam1_y_hook(CpuState *cpu, uint32_t pc24) {
-  (void)pc24;
-  if (!MwIsDualViewport() || !mw_h2h_vert_widen_armed())
-    return;
-  const uint16_t wx = (uint16_t)cpu->X;
-  const uint16_t wy = (uint16_t)cpu->Y;
-  if (!mw_find_b1_obj_at(wx, wy))
-    return;
-  if (mw_dual_nearer_cam(wx, wy) == 0)
-    cpu->_flag_C = 1; /* BCS → fail; cam0 owns this pillar */
 }
 
 static int mw_h2h_spawn_y_widen_armed(void);
@@ -2037,6 +2419,21 @@ static void mw_dma_size_hook(CpuState *cpu, uint32_t pc24) {
   cpu->A = (uint16_t)(kMwDmaSizeNative +
                       (uint16_t)(2 * (pad_left + pad_right)));
 
+  /* Latch for SNESRECOMP_MW_COLDUMP (last successful widen this frame). */
+  {
+    extern int snes_frame_counter;
+    s_coldump_pad_l = pad_left;
+    s_coldump_pad_r = pad_right;
+    s_coldump_dasiz = cpu->A;
+    s_coldump_aadr0 = aAdr0;
+    s_coldump_aadr1 = g_dma ? g_dma->channel[0].aAdr : aAdr0;
+    s_coldump_vm0 = vmadd0;
+    s_coldump_vm1 = g_ppu ? g_ppu->vramPointer : vmadd0;
+    s_coldump_dma_pc = pc24;
+    s_coldump_dma_frame = snes_frame_counter;
+    s_coldump_dma_dirty = 1;
+  }
+
   static unsigned log_left = 8;
   if (log_left > 0) {
     log_left--;
@@ -2214,6 +2611,326 @@ static int mw_h2h_bg1_rebuild_armed(void) {
  *   +$00 flags (bit15 = active)  +$02 world X  +$14 next
  * Heuristic: +$04 treated as world Y for sx/sy columns (verify offline).
  */
+/*
+ * Compact JSONL column dump. Opt-in via SNESRECOMP_MW_COLDUMP.
+ * One object per emit; fields stay stable for jq / peer A↔B diff.
+ */
+static FILE *s_coldump_fp;
+static int s_coldump_armed = -1; /* -1 unknown, 0 off, 1 on */
+static int s_coldump_last_f = -1;
+static uint32_t s_coldump_last_hash;
+static unsigned s_coldump_lines;
+
+static int mw_coldump_armed(void) {
+  if (s_coldump_armed >= 0)
+    return s_coldump_armed;
+  const char *e = getenv("SNESRECOMP_MW_COLDUMP");
+  if (!e || !e[0] || e[0] == '0') {
+    s_coldump_armed = 0;
+    return 0;
+  }
+  const char *path = (e[0] == '1' && e[1] == '\0') ? "mw_coldump.jsonl" : e;
+  s_coldump_fp = fopen(path, "ab");
+  if (!s_coldump_fp) {
+    fprintf(stderr, "[mw_coldump] failed to open '%s'\n", path);
+    s_coldump_armed = 0;
+    return 0;
+  }
+  setvbuf(s_coldump_fp, NULL, _IOLBF, 0);
+  fprintf(stderr,
+          "[mw_coldump] armed → %s (JSONL mover ID: why/d0/d1/tiles/"
+          "bg_hit/dwx; strip.mism_local for local-cam columns). "
+          "Leave SNESRECOMP_MW_ELEV off for a quiet terminal.\n",
+          path);
+  s_coldump_armed = 1;
+  return 1;
+}
+
+static uint32_t mw_coldump_fnv1a_u16(uint32_t h, uint16_t v) {
+  h ^= (uint8_t)(v & 0xffu);
+  h *= 16777619u;
+  h ^= (uint8_t)(v >> 8);
+  h *= 16777619u;
+  return h;
+}
+
+/*
+ * Home-reason probe for coldump (does not change latch — calls the real
+ * home cam then classifies how that answer was produced).
+ * why: "tag" | "near" | "hyst" | "one" | "none"
+ */
+static const char *mw_coldump_home_why(uint16_t obj, int home, int *d0_out,
+                                       int *d1_out, int *mx0_out, int *my0_out,
+                                       int *mx1_out, int *my1_out) {
+  if (d0_out)
+    *d0_out = -1;
+  if (d1_out)
+    *d1_out = -1;
+  int mx0 = 0, my0 = 0, mx1 = 0, my1 = 0;
+  const int have0 = mw_find_dual_mech_xy(0, &mx0, &my0);
+  const int have1 = mw_find_dual_mech_xy(1, &mx1, &my1);
+  if (mx0_out)
+    *mx0_out = have0 ? mx0 : -1;
+  if (my0_out)
+    *my0_out = have0 ? my0 : -1;
+  if (mx1_out)
+    *mx1_out = have1 ? mx1 : -1;
+  if (my1_out)
+    *my1_out = have1 ? my1 : -1;
+  if (mw_obj_stage_prop_owner(obj) >= 0)
+    return "tag";
+  if (home < 0 || (!have0 && !have1))
+    return "none";
+  if (!(have0 && have1))
+    return "one";
+  const int owx = (int)mw_wram16((uint16_t)(obj + 2u));
+  const int owy = (int)mw_wram16((uint16_t)(obj + 4u));
+  const int32_t ax0 = (int32_t)owx - mx0;
+  const int32_t ay0 = (int32_t)owy - my0;
+  const int32_t ax1 = (int32_t)owx - mx1;
+  const int32_t ay1 = (int32_t)owy - my1;
+  const int32_t d0 = ax0 * ax0 + ay0 * ay0;
+  const int32_t d1 = ax1 * ax1 + ay1 * ay1;
+  if (d0_out)
+    *d0_out = (int)(d0 > 0x7fffffff ? 0x7fffffff : d0);
+  if (d1_out)
+    *d1_out = (int)(d1 > 0x7fffffff ? 0x7fffffff : d1);
+  const int spat = (d1 < d0) ? 1 : 0;
+  return (home == spat) ? "near" : "hyst";
+}
+
+static void mw_coldump_tick(int local_slot) {
+  if (!mw_coldump_armed() || !s_coldump_fp)
+    return;
+
+  extern int snes_frame_counter;
+  if (snes_frame_counter < 120)
+    return;
+  if (snes_frame_counter == s_coldump_last_f)
+    return;
+
+  const uint16_t cam0x = s_nmi_latched ? s_nmi_cam_x : mw_wram16(0x1E16);
+  const uint16_t cam0y = s_nmi_latched ? s_nmi_cam_y : mw_wram16(0x1E18);
+  const uint16_t cam1x = s_nmi_latched ? s_nmi_cam2_x : mw_wram16(0x1E1A);
+  const uint16_t cam1y = s_nmi_latched ? s_nmi_cam2_y : mw_wram16(0x1E1C);
+  const uint16_t src1 = mw_stage_src_bg1();
+  uint16_t pitch = mw_wram16(0x00B6);
+  if (pitch < 32)
+    pitch = 0x0290;
+
+  int slot = local_slot;
+  if (slot != 0 && slot != 1)
+    slot = snes_netplay_local_slot();
+  const uint16_t loc_x = (slot == 1) ? cam1x : cam0x;
+  const uint16_t loc_y = (slot == 1) ? cam1y : cam0y;
+  const uint16_t src_local = mw_map_src_from_42b3(loc_x, loc_y);
+
+  enum { kStripN = 22 }; /* view 17 + small east pad sample */
+  uint16_t row7f[kStripN];
+  uint16_t row7f_loc[kStripN];
+  uint16_t rowvram[kStripN];
+  int mism = 0;      /* world src1 vs VRAM — often misleading under full-frame */
+  int mism_local = 0; /* local-cam $7F vs VRAM — useful for column work */
+  uint32_t hash = 2166136261u;
+  memset(row7f, 0, sizeof(row7f));
+  memset(row7f_loc, 0, sizeof(row7f_loc));
+  memset(rowvram, 0, sizeof(rowvram));
+  if (g_ppu) {
+    const uint16_t map_base = (uint16_t)PPU_bgTilemapAdr(g_ppu, 0);
+    const uint32_t buf_tx0 = (uint32_t)loc_x >> 4;
+    const uint32_t buf_ty0 = (uint32_t)loc_y >> 4;
+    const int map_row = (int)(buf_ty0 & 31u);
+    for (int d = 0; d < kStripN; d++) {
+      if (src1) {
+        const int off = (int)src1 + d * 2;
+        if (off >= 0 && off + 1 < 0x10000)
+          row7f[d] = mw_read7f16((uint16_t)off);
+      }
+      if (src_local) {
+        const int off = (int)src_local + d * 2;
+        if (off >= 0 && off + 1 < 0x10000)
+          row7f_loc[d] = mw_read7f16((uint16_t)off);
+      }
+      const int map_col = (int)((buf_tx0 + (uint32_t)d) & 31u);
+      const uint16_t vword =
+          (uint16_t)(map_base + (map_row << 5) + map_col);
+      rowvram[d] = g_ppu->vram[vword & 0x7fffu];
+      if (row7f[d] != rowvram[d])
+        mism++;
+      if (row7f_loc[d] != rowvram[d])
+        mism_local++;
+      hash = mw_coldump_fnv1a_u16(hash, row7f_loc[d]);
+      hash = mw_coldump_fnv1a_u16(hash, rowvram[d]);
+    }
+  }
+  hash = mw_coldump_fnv1a_u16(hash, src1);
+  hash = mw_coldump_fnv1a_u16(hash, src_local);
+  hash = mw_coldump_fnv1a_u16(hash, (uint16_t)s_coldump_pad_l);
+  hash = mw_coldump_fnv1a_u16(hash, (uint16_t)s_coldump_pad_r);
+  hash = mw_coldump_fnv1a_u16(hash, s_coldump_dasiz);
+  {
+    unsigned sticky_bits = 0;
+    for (int i = 0; i < kMwPropHomeMax; i++) {
+      if (s_prop_sticky_valid[i])
+        sticky_bits += (unsigned)s_prop_sticky_n[i] + 1u;
+    }
+    hash = mw_coldump_fnv1a_u16(hash, (uint16_t)sticky_bits);
+    hash = mw_coldump_fnv1a_u16(hash, (uint16_t)s_coldump_prop_n);
+  }
+
+  const int period = MwIsDualViewport() ? 15 : 30;
+  const int hash_changed = (hash != s_coldump_last_hash);
+  const int dma_hit = s_coldump_dma_dirty &&
+                      s_coldump_dma_frame == snes_frame_counter;
+  if (!dma_hit && !hash_changed && (snes_frame_counter % period) != 0)
+    return;
+
+  s_coldump_last_f = snes_frame_counter;
+  s_coldump_last_hash = hash;
+  s_coldump_dma_dirty = 0;
+  s_coldump_lines++;
+
+  int mx0 = -1, my0 = -1, mx1 = -1, my1 = -1;
+  {
+    int t0 = 0, u0 = 0, t1 = 0, u1 = 0;
+    if (mw_find_dual_mech_xy(0, &t0, &u0)) {
+      mx0 = t0;
+      my0 = u0;
+    }
+    if (mw_find_dual_mech_xy(1, &t1, &u1)) {
+      mx1 = t1;
+      my1 = u1;
+    }
+  }
+
+  fprintf(s_coldump_fp,
+          "{\"f\":%d,\"slot\":%d,\"net\":%d,\"dual\":%d,\"master\":%llu,"
+          "\"host\":%u,\"gm\":%u,\"cam0\":[%u,%u],\"cam1\":[%u,%u],"
+          "\"loc\":[%u,%u],\"src1\":%u,\"src_loc\":%u,\"pitch\":%u,"
+          "\"bg1src\":%d,\"bg_dy\":%d,\"bg_slot\":%d,"
+          "\"mechs\":[[%d,%d],[%d,%d]],"
+          "\"dma\":{\"pc\":%u,\"pad\":[%d,%d],\"dasiz\":%u,"
+          "\"aadr\":[%u,%u],\"vm\":[%u,%u],\"f\":%d},"
+          "\"strip\":{\"n\":%d,\"mism\":%d,\"mism_local\":%d,\"hash\":%u,"
+          "\"7f\":[",
+          snes_frame_counter, slot, snes_netplay_active() ? 1 : 0,
+          MwIsDualViewport() ? 1 : 0, (unsigned long long)g_cpu.master_cycles,
+          s_lle_host_frames, (unsigned)g_ram[0x10], (unsigned)cam0x,
+          (unsigned)cam0y, (unsigned)cam1x, (unsigned)cam1y, (unsigned)loc_x,
+          (unsigned)loc_y, (unsigned)src1, (unsigned)src_local,
+          (unsigned)pitch, s_elev_bg1_src_path, s_elev_prop_bg_dy,
+          s_coldump_bg_slot, mx0, my0, mx1, my1, (unsigned)s_coldump_dma_pc,
+          s_coldump_pad_l, s_coldump_pad_r, (unsigned)s_coldump_dasiz,
+          (unsigned)s_coldump_aadr0, (unsigned)s_coldump_aadr1,
+          (unsigned)s_coldump_vm0, (unsigned)s_coldump_vm1,
+          s_coldump_dma_frame, kStripN, mism, mism_local, (unsigned)hash);
+  for (int d = 0; d < kStripN; d++) {
+    fprintf(s_coldump_fp, "%s%u", d ? "," : "", (unsigned)row7f[d]);
+  }
+  fprintf(s_coldump_fp, "],\"7f_loc\":[");
+  for (int d = 0; d < kStripN; d++) {
+    fprintf(s_coldump_fp, "%s%u", d ? "," : "", (unsigned)row7f_loc[d]);
+  }
+  fprintf(s_coldump_fp, "],\"vram\":[");
+  for (int d = 0; d < kStripN; d++) {
+    fprintf(s_coldump_fp, "%s%u", d ? "," : "", (unsigned)rowvram[d]);
+  }
+  fprintf(s_coldump_fp,
+          "]},\"cap\":{\"n\":[%u,%u],\"lo\":[%u,%u]},"
+          "\"present\":{\"slot\":%d,\"f\":%d,\"n\":%u,\"raw\":%u,"
+          "\"skip_own\":%u,\"skip_y\":%u},\"props\":[",
+          s_elev_cap_n0, s_elev_cap_n1, s_elev_cap_lo0, s_elev_cap_lo1,
+          s_coldump_present_slot, s_coldump_present_frame, s_coldump_prop_n,
+          s_coldump_prop_raw, s_coldump_skip_own, s_coldump_skip_y);
+
+  int prop_out = 0;
+  uint16_t idx = mw_wram16(0x1E14);
+  for (int guard = 0; guard < 64 && idx && prop_out < 12; guard++) {
+    const uint16_t next = mw_wram16((uint16_t)(idx + 0x14u));
+    if (mw_obj_is_stage_prop(idx)) {
+      const int home = mw_stage_prop_home_cam(idx, cam0x, cam0y, cam1x, cam1y);
+      const int ps = mw_prop_slot_for_obj(idx);
+      const unsigned sn =
+          (s_prop_sticky_valid[ps] && s_prop_sticky_obj[ps] == idx)
+              ? (unsigned)s_prop_sticky_n[ps]
+              : 0u;
+      const unsigned meta = (unsigned)mw_wram16((uint16_t)(idx + 8u));
+      const unsigned bank = (unsigned)mw_wram16((uint16_t)(idx + 0xAu));
+      const unsigned t6 = (unsigned)mw_wram16((uint16_t)(idx + 6u));
+      const unsigned fl = (unsigned)mw_wram16(idx);
+      const unsigned act = (fl & 0x8000u) ? 1u : 0u;
+      const unsigned wx = (unsigned)mw_wram16((uint16_t)(idx + 2u));
+      const unsigned wy = (unsigned)mw_wram16((uint16_t)(idx + 4u));
+      const unsigned c = (unsigned)mw_wram16((uint16_t)(idx + 0xCu));
+      const unsigned e = (unsigned)mw_wram16((uint16_t)(idx + 0xEu));
+      const unsigned w10 = (unsigned)mw_wram16((uint16_t)(idx + 0x10u));
+      const unsigned w12 = (unsigned)mw_wram16((uint16_t)(idx + 0x12u));
+      int d0 = -1, d1 = -1, unused0, unused1, unused2, unused3;
+      const char *why =
+          mw_coldump_home_why(idx, home, &d0, &d1, &unused0, &unused1,
+                              &unused2, &unused3);
+      int dwx = 0, dwy = 0;
+      if (s_coldump_mot_valid[ps] && s_coldump_mot_obj[ps] == idx) {
+        dwx = (int)wx - (int)s_coldump_mot_wx[ps];
+        dwy = (int)wy - (int)s_coldump_mot_wy[ps];
+      }
+      s_coldump_mot_obj[ps] = idx;
+      s_coldump_mot_wx[ps] = (uint16_t)wx;
+      s_coldump_mot_wy[ps] = (uint16_t)wy;
+      s_coldump_mot_valid[ps] = 1;
+      const unsigned bg_hit =
+          (s_coldump_bg_obj[ps] == idx) ? (unsigned)s_coldump_bg_hit[ps] : 0u;
+      const unsigned bg_try =
+          (s_coldump_bg_obj[ps] == idx) ? (unsigned)s_coldump_bg_try[ps] : 0u;
+      const int draw = (home == slot && sn > 0 && act) ? 1 : 0;
+      const int sx = (int)wx - (int)loc_x;
+      const int sy = (int)wy - (int)loc_y;
+
+      fprintf(s_coldump_fp,
+              "%s{\"o\":%u,\"m\":%u,\"bank\":%u,\"t6\":%u,\"fl\":%u,"
+              "\"h\":%d,\"why\":\"%s\",\"d0\":%d,\"d1\":%d,"
+              "\"sn\":%u,\"act\":%u,\"draw\":%d,"
+              "\"wx\":%u,\"wy\":%u,\"dwx\":%d,\"dwy\":%d,"
+              "\"sx\":%d,\"sy\":%d,"
+              "\"c\":%u,\"e\":%u,\"w10\":%u,\"w12\":%u,"
+              "\"bg_try\":%u,\"bg_hit\":%u,\"tiles\":[",
+              prop_out ? "," : "", (unsigned)idx, meta, bank, t6, fl, home,
+              why, d0, d1, sn, act, draw, wx, wy, dwx, dwy, sx, sy, c, e, w10,
+              w12, bg_try, bg_hit);
+      if (sn > 0) {
+        for (unsigned t = 0; t < sn; t++) {
+          fprintf(s_coldump_fp,
+                  "%s{\"t\":%u,\"sz\":%u,\"mox\":%d,\"moy\":%d}", t ? "," : "",
+                  (unsigned)s_prop_sticky_spr[ps][t][2],
+                  (unsigned)s_prop_sticky_sz[ps][t],
+                  (int)s_prop_sticky_mox[ps][t],
+                  (int)s_prop_sticky_moy[ps][t]);
+        }
+      }
+      fprintf(s_coldump_fp, "]}");
+      prop_out++;
+    }
+    if (next == 0 || next == idx)
+      break;
+    idx = next;
+  }
+
+  /* Shared $B1 item sticky counts (despawn / half-cull checks). */
+  fprintf(s_coldump_fp, "],\"items\":[");
+  int item_out = 0;
+  for (int i = 0; i < kMwItemStickyMax && item_out < 8; i++) {
+    if (!s_item_sticky_valid[i] || !s_item_sticky_obj[i])
+      continue;
+    fprintf(s_coldump_fp, "%s{\"o\":%u,\"sn\":%u,\"m\":%u}",
+            item_out ? "," : "", (unsigned)s_item_sticky_obj[i],
+            (unsigned)s_item_sticky_n[i],
+            (unsigned)mw_wram16((uint16_t)(s_item_sticky_obj[i] + 8u)));
+    item_out++;
+  }
+  fprintf(s_coldump_fp, "],\"meta7e_max\":%u,\"lines\":%u}\n",
+          s_prop_stat_meta7e_max, s_coldump_lines);
+}
+
 static void mw_elev_dump(void) {
   static int armed = -1;
   if (armed < 0) {
@@ -2224,6 +2941,10 @@ static void mw_elev_dump(void) {
               "[mw_elev] armed — dump $1E14 objects + BG1/BG2/OAM layer "
               "signals (~2 Hz in dual H2H). Compare offline vs netplay.\n");
   }
+  /* Prefer present-time coldump (fresher sticky/present). Fallback when
+   * full-frame local present is off so 1P / half-crop still get records. */
+  if (!MwH2hFullFrameLocalArmed())
+    mw_coldump_tick(-1);
   if (!armed)
     return;
 
@@ -2266,13 +2987,19 @@ static void mw_elev_dump(void) {
       oam_mid++;
   }
 
+  /* Prefer present-time snapshot — live buffers are often cleared at NMI. */
+  const unsigned prop_lo0 = s_elev_cap_lo0;
+  const unsigned prop_lo1 = s_elev_cap_lo1;
+
   fprintf(stderr,
           "[mw_elev] f=%d dual=%d net=%d vw=%d syw=%d ff=%d gm=%02X mode=%u "
           "cam0=%04X/%04X cam1=%04X/%04X src=%04X/%04X "
           "bg2idle=%d rom_mask=%04X bg2bank_lo=%04X "
           "hs=%04X/%04X vs=%04X/%04X "
           "tile7f=%u(+%u) helper=%u(+%u) oam_on/mid=%u/%u "
-          "list=$%04X 1EB2=%04X\n",
+          "prop_lo=%u+%u cap=%u+%u "
+          "prop_stat=latch:%u list:%u commit:%u conv:%u meta7e:%u "
+          "bg1src=%d bg_dy=%d list=$%04X 1EB2=%04X\n",
           snes_frame_counter, MwIsDualViewport() ? 1 : 0,
           snes_netplay_active() ? 1 : 0, mw_h2h_vert_widen_armed() ? 1 : 0,
           mw_h2h_spawn_y_widen_armed() ? 1 : 0,
@@ -2286,6 +3013,9 @@ static void mw_elev_dump(void) {
           (unsigned)(s_nmi_latched ? s_nmi_wram_v0 : mw_wram16(0x1E5E)),
           (unsigned)(s_nmi_latched ? s_nmi_wram_v0_p2 : mw_wram16(0x1E62)),
           s_tile7f_hits, d_tile, s_tile_helper_hits, d_help, oam_on, oam_mid,
+          prop_lo0, prop_lo1, s_elev_cap_n0, s_elev_cap_n1, s_prop_stat_latch,
+          s_prop_stat_list_rec, s_prop_stat_commit, s_prop_stat_convert,
+          s_prop_stat_meta7e_max, s_elev_bg1_src_path, s_elev_prop_bg_dy,
           (unsigned)mw_wram16(0x1E14), (unsigned)mw_wram16(0x1EB2));
 
   uint16_t idx = mw_wram16(0x1E14);
@@ -2367,9 +3097,10 @@ static void mw_elev_dump(void) {
 /* Staging OAM cam tag: 0=P1 cam path, 1=P2 cam path, 0xFF=unknown. */
 static uint8_t s_oam_cam_tag[128];
 static int s_oam_draw_cam;
-/* s_oam_draw_cam: which capture buffer (sticky for all tiles of a sprite).
- * Reset on y_hi / y_e0 (→0), set on ADC #$78 (→1). Must NOT reset at tile
- * commit — that mistagged trailing P2 parts as cam 0.
+/* s_oam_draw_cam: which capture buffer. Source of truth is the drawer ADC of
+ * cam screen regs — $86/$88 → cam0, $8A/$8C → cam1 — because those are the
+ * values baked into staging X/Y. Y-CMP / ADC #$78 tags alone could leave a
+ * $8A tile committed as cam0 (P1 saw platforms track P2's camera).
  * s_oam_saw_adc78: one-shot "ROM just ADCed Y" for bias undo; cleared after
  * Y STA apply so later tiles that skip ADC still use raw A. */
 static int s_oam_saw_adc78;
@@ -2386,13 +3117,22 @@ static uint8_t s_cam_spr[2][128][4];
 static int16_t s_cam_sx[2][128];
 static int16_t s_cam_sy[2][128];
 static uint8_t s_cam_high[2][32];
-/* 1 = $00B1 pillar/platform — present local cam only (no other-cam reproject). */
-static uint8_t s_cam_local_only[2][128];
-static unsigned s_cam_n[2];
+/* s_cam_local_only / s_cam_n declared above (elev dump). 1 = stage prop. */
+/* World pixel of each captured tile; stage props present as world−local_cam. */
+static uint16_t s_cam_wx[2][128];
+static uint16_t s_cam_wy[2][128];
+/* Stage-prop commit: object + meta offsets so present rebuilds screen from
+ * live +$02/+$04 (avoids capture lag snap). Dual drawer emits into both cams;
+ * purge-before-add keeps a single tile set in the home buffer. */
+static uint16_t s_cam_prop_obj[2][128];
+static int16_t s_cam_prop_meta_ox[2][128];
+static int16_t s_cam_prop_meta_oy[2][128];
 static int s_cam_capture_frame;
 /* Set in STA $14C5 hooks; consumed at tile/attr commit. */
 static int16_t s_pending_sy;
 static int s_pending_sy_valid;
+
+static int mw_i32_abs(int32_t v) { return v < 0 ? (int)(-v) : (int)v; }
 
 static void mw_oam_cam_tag_ensure_init(void) {
   if (!s_oam_cam_tag_init) {
@@ -2407,13 +3147,65 @@ static void mw_cam_oam_reset(void) {
   memset(s_cam_sy, 0, sizeof(s_cam_sy));
   memset(s_cam_high, 0, sizeof(s_cam_high));
   memset(s_cam_local_only, 0, sizeof(s_cam_local_only));
+  memset(s_cam_shared_item, 0, sizeof(s_cam_shared_item));
+  memset(s_cam_prop_owner, -1, sizeof(s_cam_prop_owner));
+  memset(s_cam_wx, 0, sizeof(s_cam_wx));
+  memset(s_cam_wy, 0, sizeof(s_cam_wy));
+  memset(s_cam_prop_obj, 0, sizeof(s_cam_prop_obj));
+  memset(s_cam_prop_meta_ox, 0, sizeof(s_cam_prop_meta_ox));
+  memset(s_cam_prop_meta_oy, 0, sizeof(s_cam_prop_meta_oy));
   s_cam_n[0] = s_cam_n[1] = 0;
   for (int c = 0; c < 2; c++)
     for (int s = 0; s < 128; s++)
       s_cam_spr[c][s][1] = 0xf0u;
   s_cam_capture_frame = 0;
-  s_pending_b1_local_only = 0;
+  s_pending_stage_prop_local_only = 0;
+  s_draw_obj_latched = 0;
+  s_prop_purge_arm = 0;
   s_pending_sy_valid = 0;
+}
+
+/* Drop prior capture tiles for a stage prop (both cams). Compact in place. */
+static void mw_cam_purge_prop_obj(uint16_t prop_obj) {
+  if (!prop_obj)
+    return;
+  for (int c = 0; c < 2; c++) {
+    unsigned w = 0;
+    for (unsigned i = 0; i < s_cam_n[c]; i++) {
+      if (s_cam_local_only[c][i] && s_cam_prop_obj[c][i] == prop_obj)
+        continue;
+      if (w != i) {
+        memcpy(s_cam_spr[c][w], s_cam_spr[c][i], 4);
+        s_cam_sx[c][w] = s_cam_sx[c][i];
+        s_cam_sy[c][w] = s_cam_sy[c][i];
+        s_cam_wx[c][w] = s_cam_wx[c][i];
+        s_cam_wy[c][w] = s_cam_wy[c][i];
+        s_cam_local_only[c][w] = s_cam_local_only[c][i];
+        s_cam_shared_item[c][w] = s_cam_shared_item[c][i];
+        s_cam_prop_owner[c][w] = s_cam_prop_owner[c][i];
+        s_cam_prop_obj[c][w] = s_cam_prop_obj[c][i];
+        s_cam_prop_meta_ox[c][w] = s_cam_prop_meta_ox[c][i];
+        s_cam_prop_meta_oy[c][w] = s_cam_prop_meta_oy[c][i];
+        {
+          const uint8_t h =
+              (uint8_t)((s_cam_high[c][i >> 2] >> ((i & 3u) * 2u)) & 3u);
+          const unsigned wb = w >> 2;
+          const unsigned ws = (w & 3u) * 2u;
+          s_cam_high[c][wb] = (uint8_t)(
+              (s_cam_high[c][wb] & ~(uint8_t)(3u << ws)) | (uint8_t)(h << ws));
+        }
+      }
+      w++;
+    }
+    for (unsigned i = w; i < s_cam_n[c]; i++) {
+      s_cam_spr[c][i][1] = 0xf0u;
+      s_cam_local_only[c][i] = 0;
+      s_cam_shared_item[c][i] = 0;
+      s_cam_prop_obj[c][i] = 0;
+      s_cam_prop_owner[c][i] = (int8_t)-1;
+    }
+    s_cam_n[c] = w;
+  }
 }
 
 /* Present-only VRAM word backup so local strip rebuild cannot desync sim.
@@ -2451,10 +3243,12 @@ static void mw_vram_restore(void) {
  * mw_shadow_world / mw_best_bg1_src (cam≠scroll coarse caused diagonal
  * slide+snap while OAM stayed camera-locked).
  *
- * BG1: prefer live/sticky stripe src walked by the half→full Y delta in
- * pitch rows. Naive $42B3(shifted cam) can land one tile off the DMA'd
- * dual strip on some stages (moving ledges under the mech).
- * raw_cam_y = scroll_y before present Y recenter (0 → use scroll only).
+ * BG1: always key from $7E:42B3 at the local present origin. Dual-sim sticky
+ * / $1E36 is one shared DMA strip (P1-oriented); overwriting a valid 42B3
+ * src with it made both peers paint P1 floors/walls and shake when P2 moved.
+ * Sticky/live is fallback only when 42B3 is unset, then walked by the
+ * half→full Y delta in pitch rows. raw_cam_y = scroll before Y recenter
+ * (0 → no sticky walk).
  */
 static void mw_present_rebuild_layer_strip(int layer, uint16_t cam_x,
                                           uint16_t cam_y, uint16_t scroll_x,
@@ -2471,16 +3265,37 @@ static void mw_present_rebuild_layer_strip(int layer, uint16_t cam_x,
   uint16_t src_w = mw_map_src_from_42b3(scroll_x, scroll_y);
   if (!src_w)
     src_w = mw_map_src_from_42b3(cam_x, cam_y);
-  const uint16_t sticky =
-      (layer == 0) ? s_sticky_src_bg1 : s_sticky_src_bg2;
-  const uint16_t live = (layer == 0)
-                            ? (s_nmi_latched ? s_nmi_src_bg1 : mw_wram16(0x1E36))
-                            : (s_nmi_latched ? s_nmi_src_bg2 : mw_wram16(0x1E38));
-  uint16_t src = src_w ? src_w : (sticky ? sticky : live);
-
-  if (layer == 0 && raw_cam_y != 0) {
+  uint16_t src = src_w;
+  int src_path = src ? 1 : 0;
+  /*
+   * Full-frame H2H BG1: never sticky / $1E36. That strip is built from P1
+   * $1E16/$1E18 only ($809471) — using it on P2 paints P1-oriented rows while
+   * OAM tracks local_slot, so mover brown (patched at objY+$28) drifts vs the
+   * OAM stripe as cameras / platform Y diverge (gap wider when high).
+   */
+  if (!src && layer == 0 && s_present_h2h_full_frame && raw_cam_y != 0) {
+    const uint16_t src_raw = mw_map_src_from_42b3(scroll_x, raw_cam_y);
+    if (src_raw) {
+      /* 42B3 rows are 16px; walk by half→full delta (multiple of 16). */
+      const int dy = (int)raw_cam_y - (int)scroll_y;
+      const int d_tiles = dy / 16;
+      const int adj = (int)src_raw - d_tiles * (int)pitch;
+      if (adj > 0 && adj < 0x10000) {
+        src = (uint16_t)adj;
+        src_path = 2;
+      }
+    }
+    if (!src)
+      src_path = 3; /* skip rather than paint P1 $1E36 */
+  } else if (!src) {
+    const uint16_t sticky =
+        (layer == 0) ? s_sticky_src_bg1 : s_sticky_src_bg2;
+    const uint16_t live =
+        (layer == 0)
+            ? (s_nmi_latched ? s_nmi_src_bg1 : mw_wram16(0x1E36))
+            : (s_nmi_latched ? s_nmi_src_bg2 : mw_wram16(0x1E38));
     const uint16_t live_src = sticky ? sticky : live;
-    if (live_src) {
+    if (live_src && layer == 0 && raw_cam_y != 0) {
       const unsigned sh = PPU_bigTiles(g_ppu, 0) ? 4u : 3u;
       const int tile_px = 1 << (int)sh;
       const int dy = (int)raw_cam_y - (int)scroll_y; /* usually y_bg */
@@ -2488,8 +3303,15 @@ static void mw_present_rebuild_layer_strip(int layer, uint16_t cam_x,
       const int adj = (int)live_src - d_tiles * (int)pitch;
       if (adj > 0 && adj < 0x10000)
         src = (uint16_t)adj;
+      else
+        src = live_src;
+    } else {
+      src = live_src;
     }
+    src_path = src ? 4 : 0;
   }
+  if (layer == 0)
+    s_elev_bg1_src_path = src_path;
   if (!src)
     return;
 
@@ -2540,6 +3362,180 @@ static int mw_present_strip_rows(int layer) {
   if (rows > 32)
     rows = 32;
   return rows;
+}
+
+/* $809A18 addressing: $7F byte offset from world pixels. */
+static uint16_t mw_7f_off_from_world(uint16_t world_x, uint16_t world_y) {
+  const uint16_t row_i = (uint16_t)((world_y & (uint16_t)~15u) >> 3);
+  const uint16_t col_i = (uint16_t)((world_x & (uint16_t)~15u) >> 3);
+  const uint16_t base = mw_wram16((uint16_t)(0x42B3u + row_i));
+  if (!base)
+    return 0;
+  return (uint16_t)(base + col_i);
+}
+
+/* Map world pixel to BG1 VRAM word for the present strip, or -1 if outside.
+ * row_slop: ±1 for normal; larger for foreign-mover blank (trail ghosts). */
+static int mw_bg1_world_to_vaddr_slop(uint16_t world_x, uint16_t world_y,
+                                      uint16_t scroll_x, uint16_t scroll_y,
+                                      int row_slop) {
+  if (!g_ppu)
+    return -1;
+  if (row_slop < 1)
+    row_slop = 1;
+  const unsigned sh = PPU_bigTiles(g_ppu, 0) ? 4u : 3u;
+  const int view_cols = 256 >> (int)sh;
+  const int n_rows = mw_present_strip_rows(0);
+  const int32_t tx =
+      (int32_t)(world_x >> sh) - (int32_t)(scroll_x >> sh);
+  const int32_t ty =
+      (int32_t)(world_y >> sh) - (int32_t)(scroll_y >> sh);
+  int pad = (g_ws_active && g_ws_extra > 0) ? mw_ws_tile_pad() : 0;
+  if (pad < 0)
+    pad = 0;
+  if (tx < -1 || tx >= view_cols + 1 + pad)
+    return -1;
+  if (ty < -row_slop || ty >= n_rows + row_slop)
+    return -1;
+  const uint16_t map_base = (uint16_t)PPU_bgTilemapAdr(g_ppu, 0);
+  const int x_mask = PPU_bgTilemapWider(g_ppu, 0) ? 63 : 31;
+  const int map_col =
+      (int)(((uint32_t)(scroll_x >> sh) + (uint32_t)tx) & (uint32_t)x_mask);
+  const int map_row =
+      (int)(((uint32_t)(scroll_y >> sh) + (uint32_t)ty) & 31u);
+  const int half = (x_mask > 31 && map_col >= 32) ? 0x400 : 0;
+  return (int)(map_base + half + (map_row << 5) + (map_col & 31));
+}
+
+static int mw_bg1_world_to_vaddr(uint16_t world_x, uint16_t world_y,
+                                 uint16_t scroll_x, uint16_t scroll_y) {
+  return mw_bg1_world_to_vaddr_slop(world_x, world_y, scroll_x, scroll_y, 1);
+}
+
+/* Blank one BG1 cell; prefer terrain above the mover, else 0.
+ * ±3 row slop matches mw_prop_blank_band (trail ghosts at strip edge). */
+static void mw_bg1_blank_world(uint16_t wx, uint16_t wy, uint16_t scroll_x,
+                               uint16_t scroll_y) {
+  const int va = mw_bg1_world_to_vaddr_slop(wx, wy, scroll_x, scroll_y, 3);
+  if (va < 0)
+    return;
+  uint16_t under = 0;
+  for (int up = 32; up <= 80; up += 16) {
+    const uint16_t off = mw_7f_off_from_world(wx, (uint16_t)((int)wy - up));
+    if (!off)
+      continue;
+    const uint16_t t = mw_read7f16(off);
+    if (t != 0 && t != 0x0DAEu) {
+      under = t;
+      break;
+    }
+  }
+  mw_vram_save_word((uint16_t)va);
+  g_ppu->vram[(unsigned)va & 0x7fffu] = under;
+}
+
+/* Blank a tall/wide band around a world point (stripe + brown body). */
+static unsigned mw_prop_blank_band(int owx, int owy, uint16_t scroll_x,
+                                   uint16_t scroll_y) {
+  static const int kDx[7] = {-0x30, -0x20, -0x10, 0, 0x10, 0x20, 0x30};
+  unsigned hit = 0;
+  for (int dy = -64; dy <= 0x80; dy += 8) {
+    for (int k = 0; k < 7; k++) {
+      const uint16_t bx = (uint16_t)(owx + kDx[k]);
+      const uint16_t by = (uint16_t)(owy + dy);
+      /* ±3 row slop: trail ghosts just outside the rebuilt strip edge. */
+      if (mw_bg1_world_to_vaddr_slop(bx, by, scroll_x, scroll_y, 3) >= 0) {
+        mw_bg1_blank_world(bx, by, scroll_x, scroll_y);
+        hit++;
+      }
+    }
+  }
+  return hit;
+}
+
+/*
+ * Shared $7F still carries every mover's brown body. After local BG1 rebuild
+ * (and again after margin prefill): blank foreign movers at live pos AND the
+ * previous trail cell (shared $7F leaves ghosts when a platform rides away).
+ */
+static void mw_present_align_stage_prop_bg1(int local_slot, uint16_t loc_x,
+                                            uint16_t loc_y, uint16_t oth_x,
+                                            uint16_t oth_y, uint16_t scroll_x,
+                                            uint16_t scroll_y) {
+  s_elev_prop_bg_dy = 0;
+  if (!g_ppu || !s_present_h2h_full_frame || !MwIsDualViewport())
+    return;
+  if (local_slot != 0 && local_slot != 1)
+    return;
+
+  const uint16_t c0x = (local_slot == 0) ? loc_x : oth_x;
+  const uint16_t c0y = (local_slot == 0) ? loc_y : oth_y;
+  const uint16_t c1x = (local_slot == 1) ? loc_x : oth_x;
+  const uint16_t c1y = (local_slot == 1) ? loc_y : oth_y;
+  unsigned n_hide = 0;
+  unsigned n_try = 0;
+  memset(s_coldump_bg_obj, 0, sizeof(s_coldump_bg_obj));
+  memset(s_coldump_bg_hit, 0, sizeof(s_coldump_bg_hit));
+  memset(s_coldump_bg_try, 0, sizeof(s_coldump_bg_try));
+  s_coldump_bg_slot = local_slot;
+
+  uint16_t idx = mw_wram16(0x1E14u);
+  for (int guard = 0; guard < 64 && idx; guard++) {
+    const uint16_t next = mw_wram16((uint16_t)(idx + 0x14u));
+    if (mw_obj_is_stage_prop(idx)) {
+      const int home = mw_stage_prop_home_cam(idx, c0x, c0y, c1x, c1y);
+      const int owx = (int)mw_wram16((uint16_t)(idx + 2u));
+      const int owy = (int)mw_wram16((uint16_t)(idx + 4u));
+      const int ts = mw_prop_slot_for_obj(idx);
+      const int had = s_prop_trail_valid[ts] && s_prop_trail_obj[ts] == idx;
+      const int pwx = had ? (int)s_prop_trail_wx[ts] : owx;
+      const int pwy = had ? (int)s_prop_trail_wy[ts] : owy;
+      /* Unassigned (−1) blanks on both peers until sticky home latches. */
+      if (home != local_slot) {
+        n_try++;
+        unsigned hit = mw_prop_blank_band(owx, owy, scroll_x, scroll_y);
+        if (had && (pwx != owx || pwy != owy))
+          hit += mw_prop_blank_band(pwx, pwy, scroll_x, scroll_y);
+        if (ts >= 0 && ts < 24) {
+          s_coldump_bg_obj[ts] = idx;
+          s_coldump_bg_hit[ts] = (uint16_t)(hit > 0xffffu ? 0xffffu : hit);
+          s_coldump_bg_try[ts] = 1;
+        }
+        if (hit)
+          n_hide++;
+        else if (getenv("SNESRECOMP_MW_ELEV")) {
+          static unsigned miss_logs;
+          if (miss_logs < 16u) {
+            miss_logs++;
+            const int sx = owx - (int)scroll_x;
+            const int sy = owy - (int)scroll_y;
+            fprintf(stderr,
+                    "[mw_prop] bg_miss obj=$%04X home=%d slot=%d "
+                    "ow=$%04X/$%04X scrn=%d,%d scroll=$%04X/$%04X\n",
+                    (unsigned)idx, home, local_slot, (unsigned)owx,
+                    (unsigned)owy, sx, sy, (unsigned)scroll_x,
+                    (unsigned)scroll_y);
+          }
+        }
+      }
+      s_prop_trail_obj[ts] = idx;
+      s_prop_trail_wx[ts] = (uint16_t)owx;
+      s_prop_trail_wy[ts] = (uint16_t)owy;
+      s_prop_trail_valid[ts] = 1;
+    }
+    if (next == 0 || next == idx)
+      break;
+    idx = next;
+  }
+
+  s_elev_prop_bg_dy = (int)n_hide;
+  if (getenv("SNESRECOMP_MW_ELEV")) {
+    static int log_div;
+    if ((log_div++ % 30) == 0)
+      fprintf(stderr,
+              "[mw_rtl] H2H stage-prop BG1: hide_foreign=%u try=%u slot=%d\n",
+              n_hide, n_try, local_slot);
+  }
 }
 
 static void mw_present_rebuild_local_strips(uint16_t cam_x, uint16_t cam_y,
@@ -2774,19 +3770,17 @@ static int mw_ppu_oam_read_x(int slot, int extra) {
   return mw_oam_screen_x_from_9bit(mw_ppu_oam_read_x9(slot), extra);
 }
 
+static int mw_cam_find_xy(int cam, int sx, int sy, uint8_t tile, int tol);
+
 /* Append one finished staging sprite (X/Y already stored; A = tile|attr).
- * Camera = s_oam_draw_cam (sticky per sprite; not cleared here).
+ * Camera = s_oam_draw_cam from ADC $86/$88 vs $8A/$8C; stage props may
+ * re-pick cam by matching object world to cam+screen (mistag repair).
  * Prefers pending pre-bias sy from the STA $14C5 hook so bottom tiles that
  * park staging Y at $F0 (biased ≥ $F0) still reach full-frame present. */
 static void mw_cam_oam_commit(unsigned src_off, uint16_t tile_attr) {
   if (!mw_h2h_vert_widen_armed() || !MwIsDualViewport())
     return;
   if (src_off & 3u || src_off >= 128u * 4u)
-    return;
-
-  const int cam = (s_oam_draw_cam == 1) ? 1 : 0;
-
-  if (s_cam_n[cam] >= 128u)
     return;
 
   int16_t sy;
@@ -2800,9 +3794,30 @@ static void mw_cam_oam_commit(unsigned src_off, uint16_t tile_attr) {
       return;
     sy = (int16_t)((int)y - 0x78);
   }
-  /* Match vert-widen window: top #$FF70 (−144) … bottom #$E0. */
-  if (sy < -144 || sy >= 0xE0)
-    return;
+  /*
+   * Vert-widen window is −144…#$E0 for gameplay. Stage props / shared $B1
+   * items may convert or sit at sy'≥$E0 — still capture so present can
+   * rebuild (movers: live +$02/+$04; items: multi-tile sticky + world
+   * present). Shared pickups often emit at sy≈−400 vs far dual cam —
+   * capture them anyway and store world meta offsets.
+   */
+  {
+    const uint16_t y_meta = mw_wram16(0x0082u);
+    const uint16_t y_bank = mw_wram16(0x0084u);
+    const int shared_item =
+        mw_obj_is_shared_b1_item(s_draw_obj_latched) ||
+        (y_bank == 0x00B1u && mw_is_shared_b1_item_meta(y_meta));
+    const int b1_wide =
+        (y_bank == 0x00B1u && y_meta != 0 && y_meta != 0xD5B8u);
+    const int prop_cand =
+        mw_obj_is_stage_prop(s_draw_obj_latched) ||
+        s_pending_stage_prop_local_only ||
+        (y_bank == 0x00B1u && mw_is_stage_prop_meta(y_meta)) || b1_wide;
+    const int y_lo = shared_item ? -512 : -144;
+    const int y_hi = (prop_cand || shared_item) ? 0x120 : 0xE0;
+    if (sy < y_lo || sy >= y_hi)
+      return;
+  }
 
   const unsigned src_slot = src_off / 4u;
   const unsigned src_byte = 0x16C4u + (src_slot >> 2);
@@ -2812,8 +3827,157 @@ static void mw_cam_oam_commit(unsigned src_off, uint16_t tile_attr) {
   const int extra =
       (g_ws_active && g_ws_extra > 0) ? IntMin(g_ws_extra, kWsExtraMax) : 0;
   const int sx = mw_oam_signed_sx_from_9bit(x9, extra, src_slot);
-  /* Drop draw-cam offscreen X so far shots aren't kept as wrap ghosts. */
-  if (sx + 64 < -extra - 64 || sx > 256 + extra + 64)
+  /*
+   * Drop draw-cam offscreen X so far shots aren't kept as wrap ghosts.
+   * Stage props / shared $B1 items: widen so sibling meta tiles that sit
+   * just past the 256px edge still reach multi-tile sticky (half-off movers
+   * at sx≈261 used to keep one tile and permanently drop the rest).
+   */
+  {
+    const uint16_t y_meta = mw_wram16(0x0082u);
+    const uint16_t y_bank = mw_wram16(0x0084u);
+    const int wide_x =
+        mw_obj_is_stage_prop(s_draw_obj_latched) ||
+        s_pending_stage_prop_local_only ||
+        mw_obj_is_shared_b1_item(s_draw_obj_latched) ||
+        (y_bank == 0x00B1u && y_meta != 0 && y_meta != 0xD5B8u);
+    const int x_lo = wide_x ? (-extra - 256) : (-extra - 64);
+    const int x_hi = wide_x ? (256 + extra + 256) : (256 + extra + 64);
+    if (sx + 64 < x_lo || sx > x_hi)
+      return;
+  }
+
+  const uint16_t cam0x = s_nmi_latched ? s_nmi_cam_x : mw_wram16(0x1E16u);
+  const uint16_t cam0y = s_nmi_latched ? s_nmi_cam_y : mw_wram16(0x1E18u);
+  const uint16_t cam1x = s_nmi_latched ? s_nmi_cam2_x : mw_wram16(0x1E1Au);
+  const uint16_t cam1y = s_nmi_latched ? s_nmi_cam2_y : mw_wram16(0x1E1Cu);
+
+  const int draw_cam = (s_oam_draw_cam == 1) ? 1 : 0;
+  int cam = draw_cam;
+  int sx_i = sx;
+  int sy_i = (int)sy;
+  uint16_t wx = (uint16_t)((int32_t)(cam ? cam1x : cam0x) + sx_i);
+  uint16_t wy = (uint16_t)((int32_t)(cam ? cam1y : cam0y) + sy_i);
+  /*
+   * Stage props ($00B1≠$D5B8): recover object from latch and/or dual-list
+   * $96→$136E (tile emit replaces X with flags&6). Home cam = hi-byte +$06
+   * or nearer dual camera — convert sx/sy into that buffer so the far peer
+   * does not present a ghost (dual drawer emits into both cams).
+   */
+  int prop_owner = -1;
+  uint16_t prop_obj = s_draw_obj_latched;
+  if (!mw_obj_is_stage_prop(prop_obj)) {
+    const uint16_t list_obj = mw_dual_draw_list_obj();
+    if (mw_obj_is_stage_prop(list_obj)) {
+      prop_obj = list_obj;
+      s_draw_obj_latched = list_obj;
+      s_prop_stat_list_rec++;
+    }
+  }
+  const uint16_t meta_lo = mw_wram16(0x0082u);
+  const uint16_t meta_hi = mw_wram16(0x0084u);
+  int local_only = 0;
+  if (mw_obj_is_stage_prop(prop_obj)) {
+    local_only = 1;
+    s_pending_stage_prop_local_only = 1;
+  } else if (s_pending_stage_prop_local_only ||
+             (meta_hi == 0x00B1u && mw_is_stage_prop_meta(meta_lo))) {
+    /* Require real stage-prop meta — do not tag every $00B1 bank draw. */
+    local_only = 1;
+    s_pending_stage_prop_local_only = 1;
+  }
+  /*
+   * Recover mover by object +$08 == live meta $82 only. A loose screen-XY
+   * match (adx≤16, ady≤64) stole mech tiles standing on $C6A4/$C382 — tagged
+   * local_only then dropped from gameplay present (P2 mech vanished).
+   */
+  if (!mw_obj_is_stage_prop(prop_obj) && meta_hi == 0x00B1u &&
+      mw_is_stage_prop_meta(meta_lo)) {
+    const uint16_t dcx = draw_cam ? cam1x : cam0x;
+    uint16_t best = 0;
+    int best_score = 0x7fffffff;
+    uint16_t idx = mw_wram16(0x1E14u);
+    for (int guard = 0; guard < 64 && idx; guard++) {
+      const uint16_t next = mw_wram16((uint16_t)(idx + 0x14u));
+      if (mw_obj_is_stage_prop(idx)) {
+        const uint16_t om = mw_wram16((uint16_t)(idx + 8u));
+        if (om == meta_lo) {
+          const int psx = (int)mw_wram16((uint16_t)(idx + 2u)) - (int)dcx;
+          const int adx = mw_i32_abs(psx - sx_i);
+          /* meta hit — ignore Y lag vs +$04; keep X within stripe width. */
+          if (adx <= 48 && adx < best_score) {
+            best_score = adx;
+            best = idx;
+          }
+        }
+      }
+      if (next == 0 || next == idx)
+        break;
+      idx = next;
+    }
+    if (best) {
+      prop_obj = best;
+      s_draw_obj_latched = best;
+      local_only = 1;
+      s_pending_stage_prop_local_only = 1;
+      s_prop_stat_list_rec++;
+    }
+  }
+  if (local_only) {
+    const int have_obj = mw_obj_is_stage_prop(prop_obj);
+    prop_owner =
+        have_obj ? mw_stage_prop_home_cam(prop_obj, cam0x, cam0y, cam1x, cam1y)
+                 : -1;
+    int want = cam;
+    uint16_t owx = 0;
+    if (have_obj)
+      owx = mw_wram16((uint16_t)(prop_obj + 2u));
+    /*
+     * Only rebucket when home is known. Unassigned (-1) keeps drawer cam
+     * but present/BG will suppress until sticky latches — avoids dual-ghost
+     * and convert thrash from cam-distance heuristics.
+     */
+    if (prop_owner >= 0)
+      want = prop_owner;
+    if (want != draw_cam) {
+      const uint16_t ocx = draw_cam ? cam1x : cam0x;
+      const uint16_t ocy = draw_cam ? cam1y : cam0y;
+      const uint16_t ncx = want ? cam1x : cam0x;
+      const uint16_t ncy = want ? cam1y : cam0y;
+      sx_i += (int)ocx - (int)ncx;
+      sy_i += (int)ocy - (int)ncy;
+      s_prop_stat_convert++;
+    }
+    cam = want;
+    if (have_obj) {
+      const int32_t offx =
+          (int32_t)sx_i - ((int32_t)owx - (int32_t)(cam ? cam1x : cam0x));
+      wx = (uint16_t)((int32_t)owx + offx);
+    } else {
+      wx = (uint16_t)((int32_t)(cam ? cam1x : cam0x) + sx_i);
+    }
+    wy = (uint16_t)((int32_t)(cam ? cam1y : cam0y) + sy_i);
+    s_prop_stat_commit++;
+    if (getenv("SNESRECOMP_MW_ELEV") && (s_prop_stat_commit <= 48u ||
+                                         (s_prop_stat_commit % 120u) == 0u)) {
+      fprintf(stderr,
+              "[mw_prop] commit obj=$%04X owx=$%04X +6=$%04X owner=%d "
+              "draw=%d sx=%d sy=%d → cam%d sx'=%d sy'=%d wx=$%04X wy=$%04X\n",
+              (unsigned)prop_obj, (unsigned)owx,
+              have_obj ? (unsigned)mw_wram16((uint16_t)(prop_obj + 6u)) : 0u,
+              prop_owner, draw_cam, sx, (int)sy, cam, sx_i, sy_i, (unsigned)wx,
+              (unsigned)wy);
+    }
+  }
+
+  /* Dual drawer emits the same prop into both cams; purge so home keeps one. */
+  if (local_only && mw_obj_is_stage_prop(prop_obj) &&
+      s_prop_purge_arm == prop_obj) {
+    mw_cam_purge_prop_obj(prop_obj);
+    s_prop_purge_arm = 0;
+  }
+
+  if (s_cam_n[cam] >= 128u)
     return;
 
   const unsigned dst = s_cam_n[cam]++;
@@ -2821,9 +3985,37 @@ static void mw_cam_oam_commit(unsigned src_off, uint16_t tile_attr) {
   s_cam_spr[cam][dst][1] = g_ram[0x14C5u + src_off]; /* biased / parked */
   s_cam_spr[cam][dst][2] = (uint8_t)(tile_attr & 0xffu);
   s_cam_spr[cam][dst][3] = (uint8_t)(tile_attr >> 8);
-  s_cam_sx[cam][dst] = (int16_t)sx;
-  s_cam_sy[cam][dst] = sy;
-  s_cam_local_only[cam][dst] = s_pending_b1_local_only ? 1u : 0u;
+  s_cam_sx[cam][dst] = (int16_t)sx_i;
+  s_cam_sy[cam][dst] = (int16_t)sy_i;
+  s_cam_wx[cam][dst] = wx;
+  s_cam_wy[cam][dst] = wy;
+  s_cam_local_only[cam][dst] = local_only ? 1u : 0u;
+  s_cam_shared_item[cam][dst] = 0;
+  s_cam_prop_owner[cam][dst] = local_only ? (int8_t)prop_owner : (int8_t)-1;
+  if (local_only && mw_obj_is_stage_prop(prop_obj)) {
+    const uint16_t owx = mw_wram16((uint16_t)(prop_obj + 2u));
+    const uint16_t owy = mw_wram16((uint16_t)(prop_obj + 4u));
+    const uint16_t cx = cam ? cam1x : cam0x;
+    const uint16_t cy = cam ? cam1y : cam0y;
+    const int16_t mox = (int16_t)(sx_i - ((int)owx - (int)cx));
+    int16_t moy = (int16_t)(sy_i - ((int)owy - (int)cy));
+    s_cam_prop_obj[cam][dst] = prop_obj;
+    s_cam_prop_meta_ox[cam][dst] = mox;
+    s_cam_prop_meta_oy[cam][dst] = moy;
+    {
+      const uint8_t spr[4] = {
+          g_ram[0x14C4u + src_off], g_ram[0x14C5u + src_off],
+          (uint8_t)(tile_attr & 0xffu), (uint8_t)(tile_attr >> 8)};
+      const uint8_t sz = (uint8_t)((g_ram[src_byte] >> src_sh) & 2u);
+      if (moy == 0)
+        moy = -10;
+      mw_prop_sticky_store(prop_obj, spr, sz, mox, moy);
+    }
+  } else {
+    s_cam_prop_obj[cam][dst] = 0;
+    s_cam_prop_meta_ox[cam][dst] = 0;
+    s_cam_prop_meta_oy[cam][dst] = 0;
+  }
   s_cam_capture_frame = 1;
 
   const uint8_t src_h = (uint8_t)((g_ram[src_byte] >> src_sh) & 3u);
@@ -2836,6 +4028,100 @@ static void mw_cam_oam_commit(unsigned src_off, uint16_t tile_attr) {
   mw_oam_cam_tag_ensure_init();
   if (src_slot < 128u)
     s_oam_cam_tag[src_slot] = (uint8_t)cam;
+
+  /*
+   * Shared bank-$B1 items (pickups/crates, not movers): dual drawer emits
+   * each tile into cam0 then cam1; OAM pressure often drops half the
+   * sprite. Mirror into the other cam AND accumulate multi-tile sticky
+   * with world meta offsets — present places the full set for both peers.
+   */
+  if (!local_only && meta_hi == 0x00B1u &&
+      mw_is_shared_b1_item_meta(meta_lo)) {
+    uint16_t item_obj = prop_obj;
+    if (!mw_obj_is_shared_b1_item(item_obj)) {
+      const uint16_t list_obj = mw_dual_draw_list_obj();
+      if (mw_obj_is_shared_b1_item(list_obj))
+        item_obj = list_obj;
+      else {
+        uint16_t idx = mw_wram16(0x1E14u);
+        uint16_t best = 0;
+        int best_score = 0x7fffffff;
+        const uint16_t dcx = cam ? cam1x : cam0x;
+        for (int guard = 0; guard < 64 && idx; guard++) {
+          const uint16_t next = mw_wram16((uint16_t)(idx + 0x14u));
+          if (mw_obj_is_shared_b1_item(idx) &&
+              mw_wram16((uint16_t)(idx + 8u)) == meta_lo) {
+            const int psx =
+                (int)mw_wram16((uint16_t)(idx + 2u)) - (int)dcx;
+            const int adx = mw_i32_abs(psx - sx_i);
+            if (adx < best_score) {
+              best_score = adx;
+              best = idx;
+            }
+          }
+          if (next == 0 || next == idx)
+            break;
+          idx = next;
+        }
+        if (best)
+          item_obj = best;
+      }
+    }
+    if (mw_obj_is_shared_b1_item(item_obj)) {
+      const uint16_t owx = mw_wram16((uint16_t)(item_obj + 2u));
+      const uint16_t owy = mw_wram16((uint16_t)(item_obj + 4u));
+      const uint16_t cx = cam ? cam1x : cam0x;
+      const uint16_t cy = cam ? cam1y : cam0y;
+      const int16_t mox = (int16_t)(sx_i - ((int)owx - (int)cx));
+      const int16_t moy = (int16_t)(sy_i - ((int)owy - (int)cy));
+      const uint8_t spr[4] = {
+          g_ram[0x14C4u + src_off], g_ram[0x14C5u + src_off],
+          (uint8_t)(tile_attr & 0xffu), (uint8_t)(tile_attr >> 8)};
+      const uint8_t sz = (uint8_t)((g_ram[src_byte] >> src_sh) & 2u);
+      mw_item_sticky_store(item_obj, spr, sz, mox, moy);
+      /* Tag capture tiles so present skips raw halves — sticky only. */
+      s_cam_shared_item[cam][dst] = 1;
+      s_cam_prop_obj[cam][dst] = item_obj;
+    }
+    const int ocam = cam ^ 1;
+    if (s_cam_n[ocam] < 128u) {
+      const uint16_t ccx = cam ? cam1x : cam0x;
+      const uint16_t ccy = cam ? cam1y : cam0y;
+      const uint16_t ocx = ocam ? cam1x : cam0x;
+      const uint16_t ocy = ocam ? cam1y : cam0y;
+      const int osx = sx_i + (int)ccx - (int)ocx;
+      const int osy = sy_i + (int)ccy - (int)ocy;
+      const uint8_t tile = (uint8_t)(tile_attr & 0xffu);
+      if (!mw_cam_find_xy(ocam, osx, osy, tile, 2)) {
+        const unsigned odst = s_cam_n[ocam]++;
+        s_cam_spr[ocam][odst][0] = g_ram[0x14C4u + src_off];
+        s_cam_spr[ocam][odst][1] = g_ram[0x14C5u + src_off];
+        s_cam_spr[ocam][odst][2] = tile;
+        s_cam_spr[ocam][odst][3] = (uint8_t)(tile_attr >> 8);
+        s_cam_sx[ocam][odst] = (int16_t)osx;
+        s_cam_sy[ocam][odst] = (int16_t)osy;
+        s_cam_wx[ocam][odst] =
+            (uint16_t)((int32_t)ocx + osx);
+        s_cam_wy[ocam][odst] =
+            (uint16_t)((int32_t)ocy + osy);
+        s_cam_local_only[ocam][odst] = 0;
+        s_cam_shared_item[ocam][odst] =
+            mw_obj_is_shared_b1_item(item_obj) ? 1u : 0u;
+        s_cam_prop_owner[ocam][odst] = (int8_t)-1;
+        s_cam_prop_obj[ocam][odst] =
+            mw_obj_is_shared_b1_item(item_obj) ? item_obj : 0;
+        s_cam_prop_meta_ox[ocam][odst] = 0;
+        s_cam_prop_meta_oy[ocam][odst] = 0;
+        {
+          const unsigned ob = odst >> 2;
+          const unsigned osh = (odst & 3u) * 2u;
+          s_cam_high[ocam][ob] = (uint8_t)(
+              (s_cam_high[ocam][ob] & ~(uint8_t)(3u << osh)) |
+              (uint8_t)(src_h << osh));
+        }
+      }
+    }
+  }
 }
 
 static void mw_h2h_vw_oam_commit_x_hook(CpuState *cpu, uint32_t pc24) {
@@ -2887,6 +4173,28 @@ static int mw_present_oam_dup(const int *xs, const int *ys, const uint8_t *tiles
  * across cam0/cam1 at different positions (mutual=0). */
 static int mw_oam_is_results_ui(uint8_t attr) {
   return (attr & 0x30u) == 0x30u;
+}
+
+/*
+ * Stage-prop OAM Y for full-frame present — always BG1-aligned
+ * (live_oy − cam_raw + moy + y_shift). Never drop y_shift: an unshifted
+ * fallback put stripes at sy≈215 while brown used cam_y=cam_raw−y_bg
+ * (~64px gap / flicker as live_ny crossed 224). Dual-bottom visibility is
+ * handled by skipping half→full Y recenter when vert-widen is on (that
+ * path already emits a ~224-tall window vs cam_raw).
+ * Returns −1 if off-screen.
+ */
+static int mw_prop_present_ny(int have_cap, int cap_sy, int live_oy, int loc_y,
+                              int moy, int y_shift) {
+  const int live_ny = (live_oy - loc_y) + moy + y_shift;
+  if (live_ny >= 0 && live_ny < 224)
+    return live_ny;
+  if (have_cap) {
+    const int cap_ny = cap_sy + y_shift;
+    if (cap_ny >= 0 && cap_ny < 224)
+      return cap_ny;
+  }
+  return -1;
 }
 
 static int mw_present_oam_place(int x, int ny, const uint8_t *sp,
@@ -3297,14 +4605,25 @@ static int mw_present_oam_from_cam_capture(int local_slot, int extra,
     }
   }
 
-  /* ---- local gameplay (skip results UI already stamped) ---- */
+  const uint16_t c0x = (local_slot == 0) ? loc_x : oth_x;
+  const uint16_t c0y = (local_slot == 0) ? loc_y : oth_y;
+  const uint16_t c1x = (local_slot == 1) ? loc_x : oth_x;
+  const uint16_t c1y = (local_slot == 1) ? loc_y : oth_y;
+
+  /* ---- local gameplay (skip results UI + stage props; props handled next) ---- */
   for (unsigned i = 0; i < s_cam_n[local_slot] && kept < 128u; i++) {
     const uint8_t *sp = s_cam_spr[local_slot][i];
     if (results_ui && mw_oam_is_results_ui(sp[3]))
       continue;
+    if (s_cam_local_only[local_slot][i])
+      continue;
+    if (s_cam_shared_item[local_slot][i])
+      continue; /* full sprite from item sticky below */
     const int x = (int)s_cam_sx[local_slot][i];
     if (x + 64 < x_lo || x > x_hi)
       continue;
+    /* local_only already skipped above. Do NOT XY-cull near stage props —
+     * mechs on $C6A4/$C382 sit inside that box and vanished (A/B: OAM_CULL=0). */
     const int ny = (int)s_cam_sy[local_slot][i] + y_shift;
     const uint8_t src_h = (uint8_t)(
         (s_cam_high[local_slot][i >> 2] >> ((i & 3u) * 2u)) & 2u);
@@ -3312,47 +4631,241 @@ static int mw_present_oam_from_cam_capture(int local_slot, int extra,
                          kept_tile, &kept, 6);
   }
 
-  /* ---- other buffer → reproject world sprites only (never results UI) ----
-   * $00B1 pillars/platforms: local-cam ownership only — reprojecting the
-   * other half is what tied their screen pos to both cameras. */
+  /* ---- stage props ($00B1≠$D5B8) ----
+   * Home-isolated multi-tile sticky. Raw cam capture is often 1 of N under
+   * dual OAM pressure — skip raw halves and place the full sticky set from
+   * live +$02/+$04 for the home peer only (same completeness model as
+   * shared $B1 items, but still skip_own for foreign homes). */
+  unsigned prop_n = 0, prop_skip_own = 0, prop_skip_y = 0, prop_raw = 0;
+  uint8_t prop_alive[kMwPropHomeMax];
+  memset(prop_alive, 0, sizeof(prop_alive));
+  if (!results_ui) {
+    uint16_t idx = mw_wram16(0x1E14u);
+    for (int guard = 0; guard < 64 && idx && kept < 128u; guard++) {
+      const uint16_t next = mw_wram16((uint16_t)(idx + 0x14u));
+      if (mw_obj_is_stage_prop(idx) && (mw_wram16(idx) & 0x8000u) != 0) {
+        const int ps = mw_prop_slot_for_obj(idx);
+        /* Mark alive on every peer so foreign-home present does not wipe
+         * the home peer's multi-tile sticky. */
+        if (s_prop_sticky_valid[ps] && s_prop_sticky_obj[ps] == idx)
+          prop_alive[ps] = 1;
+        const int home = mw_stage_prop_home_cam(idx, c0x, c0y, c1x, c1y);
+        if (home != local_slot) {
+          prop_skip_own++;
+        } else if (s_prop_sticky_valid[ps] && s_prop_sticky_obj[ps] == idx &&
+                   s_prop_sticky_n[ps] > 0) {
+          const int live_ox = (int)mw_wram16((uint16_t)(idx + 2u));
+          const int live_oy = (int)mw_wram16((uint16_t)(idx + 4u));
+          for (unsigned t = 0; t < s_prop_sticky_n[ps] && kept < 128u; t++) {
+            const uint8_t *spr = s_prop_sticky_spr[ps][t];
+            const int x =
+                (live_ox - (int)loc_x) + (int)s_prop_sticky_mox[ps][t];
+            const int ny = mw_prop_present_ny(
+                0, 0, live_oy, (int)loc_y, (int)s_prop_sticky_moy[ps][t],
+                y_shift);
+            if (x + 64 < x_lo || x > x_hi) {
+              continue;
+            }
+            if (ny < 0) {
+              prop_skip_y++;
+              continue;
+            }
+            prop_raw++;
+            if (mw_present_oam_dup(kept_x, kept_y, kept_tile, kept, x, ny,
+                                   spr[2]))
+              continue;
+            if (mw_present_oam_place(x, ny, spr, s_prop_sticky_sz[ps][t],
+                                     extra, right_hints, kept_x, kept_y,
+                                     kept_tile, &kept, 6))
+              prop_n++;
+          }
+        }
+      }
+      if (next == 0 || next == idx)
+        break;
+      idx = next;
+    }
+    for (int s = 0; s < kMwPropHomeMax; s++) {
+      if (s_prop_sticky_valid[s] && !prop_alive[s]) {
+        s_prop_sticky_valid[s] = 0;
+        s_prop_sticky_n[s] = 0;
+        s_prop_sticky_obj[s] = 0;
+      }
+    }
+  }
+  /* Fallback: raw local_only tiles when sticky is empty (first frames). */
+  for (int src = 0; src < 2 && kept < 128u; src++) {
+    for (unsigned i = 0; i < s_cam_n[src] && kept < 128u; i++) {
+      if (!s_cam_local_only[src][i])
+        continue;
+      const uint8_t *sp = s_cam_spr[src][i];
+      if (results_ui && mw_oam_is_results_ui(sp[3]))
+        continue;
+      const uint16_t pobj = s_cam_prop_obj[src][i];
+      if (!mw_obj_is_stage_prop(pobj))
+        continue;
+      const int ps = mw_prop_slot_for_obj(pobj);
+      if (s_prop_sticky_valid[ps] && s_prop_sticky_obj[ps] == pobj &&
+          s_prop_sticky_n[ps] > 0)
+        continue; /* already presented full sticky set */
+      int home = mw_stage_prop_home_cam(pobj, c0x, c0y, c1x, c1y);
+      if (home != local_slot) {
+        prop_skip_own++;
+        continue;
+      }
+      const int live_ox = (int)mw_wram16((uint16_t)(pobj + 2u));
+      const int live_oy = (int)mw_wram16((uint16_t)(pobj + 4u));
+      const int mox = (int)s_cam_prop_meta_ox[src][i];
+      const int moy = (int)s_cam_prop_meta_oy[src][i];
+      const int cap_sy = (int)s_cam_sy[src][i];
+      const int x = (live_ox - (int)loc_x) + mox;
+      const int ny =
+          mw_prop_present_ny(1, cap_sy, live_oy, (int)loc_y, moy, y_shift);
+      const uint8_t src_h = (uint8_t)(
+          (s_cam_high[src][i >> 2] >> ((i & 3u) * 2u)) & 2u);
+      if (x + 64 < x_lo || x > x_hi)
+        continue;
+      if (ny < 0) {
+        prop_skip_y++;
+        continue;
+      }
+      prop_raw++;
+      if (mw_present_oam_dup(kept_x, kept_y, kept_tile, kept, x, ny, sp[2]))
+        continue;
+      if (mw_present_oam_place(x, ny, sp, src_h, extra, right_hints, kept_x,
+                               kept_y, kept_tile, &kept, 6))
+        prop_n++;
+    }
+  }
+  /*
+   * Shared $B1 pickups/items: place full multi-tile sticky for BOTH peers
+   * from live +$02/+$04. Capture/reproject alone leave half-sprites when
+   * dual OAM pressure drops tiles or far-cam Y culls the emit.
+   */
+  if (!results_ui) {
+    uint8_t item_alive[kMwItemStickyMax];
+    memset(item_alive, 0, sizeof(item_alive));
+    uint16_t idx = mw_wram16(0x1E14u);
+    for (int guard = 0; guard < 64 && idx && kept < 128u; guard++) {
+      const uint16_t next = mw_wram16((uint16_t)(idx + 0x14u));
+      if (mw_obj_is_shared_b1_item(idx) && (mw_wram16(idx) & 0x8000u) != 0) {
+        int s = -1;
+        for (int i = 0; i < kMwItemStickyMax; i++) {
+          if (s_item_sticky_valid[i] && s_item_sticky_obj[i] == idx) {
+            s = i;
+            break;
+          }
+        }
+        if (s >= 0) {
+          item_alive[s] = 1;
+          const int live_ox = (int)mw_wram16((uint16_t)(idx + 2u));
+          const int live_oy = (int)mw_wram16((uint16_t)(idx + 4u));
+          for (unsigned t = 0; t < s_item_sticky_n[s] && kept < 128u; t++) {
+            const uint8_t *spr = s_item_sticky_spr[s][t];
+            const int x =
+                (live_ox - (int)loc_x) + (int)s_item_sticky_mox[s][t];
+            const int ny = mw_prop_present_ny(
+                0, 0, live_oy, (int)loc_y, (int)s_item_sticky_moy[s][t],
+                y_shift);
+            if (x + 64 < x_lo || x > x_hi || ny < 0)
+              continue;
+            if (mw_present_oam_dup(kept_x, kept_y, kept_tile, kept, x, ny,
+                                   spr[2]))
+              continue;
+            mw_present_oam_place(x, ny, spr, s_item_sticky_sz[s][t], extra,
+                                 right_hints, kept_x, kept_y, kept_tile,
+                                 &kept, 6);
+          }
+        }
+      }
+      if (next == 0 || next == idx)
+        break;
+      idx = next;
+    }
+    for (int s = 0; s < kMwItemStickyMax; s++) {
+      if (s_item_sticky_valid[s] && !item_alive[s]) {
+        s_item_sticky_valid[s] = 0;
+        s_item_sticky_n[s] = 0;
+        s_item_sticky_obj[s] = 0;
+      }
+    }
+  }
+  {
+    unsigned lo0 = 0, lo1 = 0;
+    for (unsigned i = 0; i < s_cam_n[0]; i++)
+      if (s_cam_local_only[0][i])
+        lo0++;
+    for (unsigned i = 0; i < s_cam_n[1]; i++)
+      if (s_cam_local_only[1][i])
+        lo1++;
+    s_elev_cap_n0 = s_cam_n[0];
+    s_elev_cap_n1 = s_cam_n[1];
+    s_elev_cap_lo0 = lo0;
+    s_elev_cap_lo1 = lo1;
+    {
+      extern int snes_frame_counter;
+      s_coldump_prop_n = prop_n;
+      s_coldump_prop_raw = prop_raw;
+      s_coldump_skip_own = prop_skip_own;
+      s_coldump_skip_y = prop_skip_y;
+      s_coldump_present_slot = local_slot;
+      s_coldump_present_frame = snes_frame_counter;
+    }
+    if (getenv("SNESRECOMP_MW_ELEV")) {
+      static int prop_log_div;
+      if ((prop_log_div++ % 30) == 0) {
+        fprintf(stderr,
+                "[mw_rtl] H2H stage-prop OAM ($00B1≠$D5B8): present "
+                "(%u tiles raw=%u; capture local_only=%u+%u slot=%d "
+                "skip_own=%u skip_y=%u "
+                "stat=latch:%u list:%u commit:%u conv:%u meta7e_max:%u "
+                "bg1src=%d bg_dy=%d)\n",
+                prop_n, prop_raw, lo0, lo1, local_slot, prop_skip_own,
+                prop_skip_y, s_prop_stat_latch, s_prop_stat_list_rec,
+                s_prop_stat_commit, s_prop_stat_convert,
+                s_prop_stat_meta7e_max, s_elev_bg1_src_path,
+                s_elev_prop_bg_dy);
+      }
+    }
+  }
+
+  /* ---- other buffer → reproject world sprites only (never results UI /
+   * stage props — those already placed above via local_only).
+   * Shared $B1 item tiles are also mirrored at capture; reproject still
+   * fills any half that only landed in the far buffer. ---- */
   const int reproj_x_lo = -extra - 48;
   const int reproj_x_hi = 256 + extra; /* exclusive: [lo, hi) stays unwrapped */
-  unsigned b1_skip = 0;
   for (unsigned i = 0; i < s_cam_n[other] && kept < 128u; i++) {
     const uint8_t *sp = s_cam_spr[other][i];
     if (results_ui && mw_oam_is_results_ui(sp[3]))
       continue;
-    if (s_cam_local_only[other][i]) {
-      b1_skip++;
+    if (s_cam_local_only[other][i])
       continue;
-    }
+    if (s_cam_shared_item[other][i])
+      continue; /* sticky present already placed full item */
     const int ox = (int)s_cam_sx[other][i];
     const int oy = (int)s_cam_sy[other][i];
     const int raw_ny = oy + y_shift;
-    /* Already on-screen locally at the same screen pos → dual half. */
-    if (mw_present_oam_dup(kept_x, kept_y, kept_tile, kept, ox, raw_ny, sp[2]))
-      continue;
     const int32_t world_x = (int32_t)oth_x + ox;
     const int32_t world_y = (int32_t)oth_y + oy;
     const int x = (int)(world_x - (int32_t)loc_x);
     const int sy = (int)(world_y - (int32_t)loc_y);
+    /* Screen-fixed dual half: same raw XY in both cams — skip. Do NOT
+     * skip on raw XY alone before reproject: that dropped the far half of
+     * sliced crates when the near half already occupied a nearby slot. */
+    if (x == ox && sy == oy &&
+        mw_present_oam_dup(kept_x, kept_y, kept_tile, kept, ox, raw_ny,
+                           sp[2]))
+      continue;
     if (x < reproj_x_lo || x >= reproj_x_hi)
       continue;
     const int ny = sy + y_shift;
+    /* Size+Xhi — keep bit0 (X9) and bit1 (size) so 16×16 items don't
+     * collapse to 8×8 (looks like a culled right half). */
     const uint8_t src_h = (uint8_t)(
-        (s_cam_high[other][i >> 2] >> ((i & 3u) * 2u)) & 2u);
+        (s_cam_high[other][i >> 2] >> ((i & 3u) * 2u)) & 3u);
     mw_present_oam_place(x, ny, sp, src_h, extra, right_hints, kept_x, kept_y,
                          kept_tile, &kept, 6);
-  }
-  if (b1_skip) {
-    static int b1_logged;
-    if (!b1_logged) {
-      b1_logged = 1;
-      fprintf(stderr,
-              "[mw_rtl] H2H B1 pillar OAM: local-cam ownership "
-              "(skipped %u other-cam reprojects)\n",
-              b1_skip);
-    }
   }
 
   PpuWsSetOamRightHints(g_ppu, right_hints);
@@ -3566,16 +5079,33 @@ static int mw_1p_y_draw_widen_armed(void) {
 }
 
 /*
+ * Dual active-list Y gate (CMP at $809280 / $8092A0): native #$A8 (or
+ * widen #$E0) drops stage props whose anchor +$04 is at sy≈225 while the
+ * stripe tiles sit ~10px higher. Force A under the threshold for stage
+ * props only — a global list widen to #$0100/#$0140 leaked P2-floor into
+ * cam0.
+ */
+static void mw_prop_list_y_gate_hook(CpuState *cpu, uint32_t pc24) {
+  (void)pc24;
+  if (!mw_h2h_vert_widen_armed() || !MwIsDualViewport())
+    return;
+  const uint16_t obj = (uint16_t)cpu->X;
+  if (!mw_obj_is_stage_prop(obj))
+    return;
+  const int16_t sy = (int16_t)cpu->A;
+  /* Match commit prop window (−144…$120). */
+  if (sy >= 0x00A0 && sy < 0x0120)
+    cpu->A = (uint16_t)0x0090; /* < #$A8 and < #$E0 → list-add path */
+}
+
+/*
  * Patch Y-window CMP immediates in ROM (interp fetches these). Never
  * rewrite A at the CMP — meta paths STA $14C5 from the same A.
  *   Bottom: #$0068 / #$0070 → #$00E0 (full-frame down; was #$78 with bias)
  *           native #$00E0 sites stay #$E0 (do NOT narrow — that clipped mechs)
  *   Top:    #$FFF1 → #$FF70 (−144)
- *   List:   #$00A8 → #$00E0 under widen. Native #$A8 drops the whole object
- *           when the anchor crosses 168 — with full-frame y_shift that pops
- *           tall sprites while upper tiles are still on-screen. Match the
- *           per-tile bottom (#$E0) so parts can slide off via PPU clip.
- *           Do NOT use #$0140 (P2-floor objects leaked into cam0 capture).
+ *   List:   #$00A8 → #$00E0 under widen (gameplay tall sprites). Stage props
+ *           with sy≥$E0 enter via mw_prop_list_y_gate_hook (prop-only).
  * Modes: 0 = native, 1 = offline 1P draw widen (no OAM bias), 4 = dual
  * H2H vert-widen (+ bias hooks elsewhere). $8283AC radius is X-heavy and
  * does not fix this clip.
@@ -3589,8 +5119,10 @@ static void mw_h2h_vert_widen_patch_imm(void) {
   else if (mw_1p_y_draw_widen_armed() && !MwIsDualViewport() &&
            mw_can_expand_gameplay())
     want = 1;
-  static int applied = -1; /* -1 unknown, 0 native, 1 = 1P, 4 = dual */
-  if (applied == want)
+  /* Gen bump: force re-apply after list #$0100 → #$E0 policy change. */
+  enum { kVertWidenPatchGen = 7 };
+  static int applied = -1; /* -1 unknown; else want + gen*10 */
+  if (applied == want + kVertWidenPatchGen * 10)
     return;
 
   static const uint16_t kCmp68[] = {
@@ -3654,35 +5186,35 @@ static void mw_h2h_vert_widen_patch_imm(void) {
       }
     }
   }
-  /* Active-list Y: #$A8 → #$E0 when widening (undo #$0140 if present). */
+  /* Active-list Y: #$A8 → #$E0 when widening (undo #$0100/#$0140 if present). */
   for (size_t i = 0; i < sizeof(kCmpA8) / sizeof(kCmpA8[0]); i++) {
     uint8_t *p = cart_getRomPtr(g_snes->cart, 0x80, kCmpA8[i]);
     if (!p || p[0] != 0xC9u)
       continue;
     const uint8_t want_lo = widen ? 0xE0u : 0xA8u;
-    if (p[2] == 0x01u && p[1] == 0x40u) {
-      /* Stale #$0140 → target. */
+    const uint8_t want_hi = 0x00u;
+    const int cur_ok = (p[1] == want_lo && p[2] == want_hi);
+    const int cur_known =
+        (p[2] == 0x00u &&
+         (p[1] == 0xA8u || p[1] == 0xE0u || p[1] == 0xF0u)) ||
+        (p[2] == 0x01u && (p[1] == 0x00u || p[1] == 0x40u));
+    if (!cur_ok && cur_known) {
       p[1] = want_lo;
-      p[2] = 0x00u;
+      p[2] = want_hi;
       n++;
-    } else if (p[2] == 0x00u &&
-               (p[1] == 0xA8u || p[1] == 0xE0u || p[1] == 0xF0u)) {
-      if (p[1] != want_lo) {
-        p[1] = want_lo;
-        n++;
-      }
     }
   }
-  applied = want;
+  applied = want + kVertWidenPatchGen * 10;
   if (n)
     fprintf(stderr,
             "[mw_rtl] Y-draw widen: %s %d CMP immediates "
             "(mode=%d top=FF70 bot=E0 list=%s)\n",
             widen ? "patched" : "restored", n, want,
-            widen ? "E0" : "A8");
+            widen ? "E0+prop-hook" : "A8");
 }
 
-/* Dual bottom-Y CMP — start of a P1 sprite (before optional ADC #$78). */
+/* Dual bottom-Y CMP on P1 ($86/$88) drawers only — not P2 ($8A/$8C) CMPs
+ * (those used to force cam0 and let $8A tiles leak into the cam0 buffer). */
 static void mw_h2h_vw_y_hi_tag_hook(CpuState *cpu, uint32_t pc24) {
   (void)cpu;
   (void)pc24;
@@ -3712,6 +5244,24 @@ static void mw_h2h_vw_y_e0_tag_hook(CpuState *cpu, uint32_t pc24) {
   s_oam_draw_cam = 0;
 }
 
+/* Drawer ADC $86/$88 — screen pos is cam0-relative. */
+static void mw_h2h_vw_pos_cam0_hook(CpuState *cpu, uint32_t pc24) {
+  (void)cpu;
+  (void)pc24;
+  if (!mw_h2h_vert_widen_armed() || !MwIsDualViewport())
+    return;
+  s_oam_draw_cam = 0;
+}
+
+/* Drawer ADC $8A/$8C — screen pos is cam1-relative. */
+static void mw_h2h_vw_pos_cam1_hook(CpuState *cpu, uint32_t pc24) {
+  (void)cpu;
+  (void)pc24;
+  if (!mw_h2h_vert_widen_armed() || !MwIsDualViewport())
+    return;
+  s_oam_draw_cam = 1;
+}
+
 /* Record pre-bias sy; keep dual staging OAM in 0..$EF (park $F0 if not). */
 static void mw_h2h_vw_apply_y_bias_for_store(CpuState *cpu) {
   int16_t sy;
@@ -3722,9 +5272,9 @@ static void mw_h2h_vw_apply_y_bias_for_store(CpuState *cpu) {
     s_oam_draw_cam = 1; /* reinforce — ADC path is always P2 half */
   } else {
     sy = (int16_t)cpu->A;
-    /* Top-band BCS can skip the Y-CMP tag hook; never leave a stale P2 cam
-     * on a non-ADC store. Dual P2 tiles always ADC #$78 before STA. */
-    s_oam_draw_cam = 0;
+    /* Do not force cam0 here: P2 tiles ADC $8C before STA Y; a forced
+     * cam0 was the leak that put $8A X into the cam0 capture buffer. Cam
+     * comes from ADC $86/$88/$8A/$8C hooks (+ ADC #$78 above). */
   }
   s_pending_sy = sy;
   s_pending_sy_valid = 1;
@@ -3924,9 +5474,6 @@ static void mw_install_dma_widen_hooks(void) {
   interp_bridge_set_pre_opcode_hook(0x828397u, mw_bbox_left_bcc_hook);
   interp_bridge_set_pre_opcode_hook(0x828383u, mw_bbox_right_bcs_hook);
   interp_bridge_set_pre_opcode_hook(0x82839Cu, mw_bbox_right_bcs_hook);
-  /* $00B1 pillars: dual bbox OR → nearer-cam ownership only. */
-  interp_bridge_set_pre_opcode_hook(0x82838Du, mw_b1_bbox_cam0_success_hook);
-  interp_bridge_set_pre_opcode_hook(0x8283A6u, mw_b1_bbox_cam1_y_hook);
   interp_bridge_set_pre_opcode_hook(0x809B43u, mw_bbox_padded_left_bcc_hook);
   interp_bridge_set_pre_opcode_hook(0x80A5ABu, mw_obj_onscreen_entry_hook);
   interp_bridge_set_pre_opcode_hook(0x80A5B6u, mw_obj_onscreen_bmi_hook);
@@ -3940,9 +5487,18 @@ static void mw_install_dma_widen_hooks(void) {
   interp_bridge_set_pre_opcode_hook(0x809A61u, mw_tile_helper_hook);
   interp_bridge_set_pre_opcode_hook(0x809A83u, mw_tile_helper_hook);
   interp_bridge_set_pre_opcode_hook(0x809A3Eu, mw_tile_helper_hook);
-  /* Active-list drawer: screen X ($808714 STA $86) and post-$8759 ($808721). */
+  /* Active-list Y CMP — stage props with sy≥$A8/$E0 still enter the list. */
+  interp_bridge_set_pre_opcode_hook(0x809280u, mw_prop_list_y_gate_hook);
+  interp_bridge_set_pre_opcode_hook(0x8092A0u, mw_prop_list_y_gate_hook);
+  /* Active-list drawer STA $86 + post-meta (1P $8086xx; H2H dual $8087A0). */
+  interp_bridge_set_pre_opcode_hook(0x808704u, mw_draw_sx_hook);
   interp_bridge_set_pre_opcode_hook(0x808714u, mw_draw_sx_hook);
   interp_bridge_set_pre_opcode_hook(0x808721u, mw_draw_meta_hook);
+  interp_bridge_set_pre_opcode_hook(0x8087DEu, mw_draw_sx_hook);
+  interp_bridge_set_pre_opcode_hook(0x808802u, mw_draw_sx_hook);
+  interp_bridge_set_pre_opcode_hook(0x80881Fu, mw_draw_meta_hook);
+  /* Dual drawer: LDA $00,X before TAX←flags&6 — reinforce, never clear. */
+  interp_bridge_set_pre_opcode_hook(0x80882Fu, mw_draw_prop_reinforce_hook);
   /* Phase 2b taller H2H: dual stripe rows + spawn Y window + OAM Y bias. */
   interp_bridge_set_pre_opcode_hook(0x8095A9u, mw_h2h_taller_stripe_hook);
   interp_bridge_set_pre_opcode_hook(0x82F62Au, mw_spawn_y_height_hook);
@@ -3955,16 +5511,26 @@ static void mw_install_dma_widen_hooks(void) {
 
   /* Full-frame vertical widen: cam tags / bias cancel (CMP imm via ROM poke). */
   {
+    /* P1 drawer Y-CMP only ($86/$88). P2 dual CMPs ($8CB6/$8E1F/…) must not
+     * force cam0 — that leaked ADC $8A tiles into the cam0 capture buffer. */
     static const uint32_t kYHiTag[] = {
-        0x808C71u, 0x808CB6u, 0x808DD3u, 0x808E1Fu,
-        0x808F4Au, 0x808F96u, 0x8090C1u, 0x809114u,
-        0x80DCACu, 0x80DCE4u,
+        0x808C71u, 0x808DD3u, 0x808F4Au, 0x8090C1u, 0x80DCACu, 0x80DCE4u,
     };
     static const uint32_t kYE0Tag[] = {
         0x808BC1u, 0x808D13u, 0x808E8Au, 0x808FFAu, 0x80DC28u,
     };
     static const uint32_t kAdc78Tag[] = {
         0x808CBCu, 0x808E25u, 0x808F9Cu, 0x80911Au, 0x80DCEAu,
+    };
+    /* Cam screen-pos ADCs — definitive capture-buffer tag. */
+    static const uint32_t kPosCam0[] = {
+        0x808BBAu, 0x808BCCu, 0x808C6Au, 0x808C7Cu, 0x808D0Cu, 0x808D25u,
+        0x808DCCu, 0x808DE5u, 0x808E83u, 0x808E95u, 0x808F43u, 0x808F55u,
+        0x808FF3u, 0x80900Cu, 0x8090BAu, 0x8090D3u,
+    };
+    static const uint32_t kPosCam1[] = {
+        0x808CAFu, 0x808CC5u, 0x808E18u, 0x808E35u, 0x808F8Fu, 0x808FA5u,
+        0x80910Du, 0x80912Au,
     };
     static const uint32_t kOamYStaX[] = {
         0x808BC6u, 0x808C76u, 0x808CBFu, 0x808D18u, 0x808DD8u, 0x808E28u,
@@ -3987,6 +5553,10 @@ static void mw_install_dma_widen_hooks(void) {
                      mw_h2h_vw_y_e0_tag_hook);
     mw_install_hooks(kAdc78Tag, sizeof(kAdc78Tag) / sizeof(kAdc78Tag[0]),
                      mw_h2h_vw_adc78_tag_hook);
+    mw_install_hooks(kPosCam0, sizeof(kPosCam0) / sizeof(kPosCam0[0]),
+                     mw_h2h_vw_pos_cam0_hook);
+    mw_install_hooks(kPosCam1, sizeof(kPosCam1) / sizeof(kPosCam1[0]),
+                     mw_h2h_vw_pos_cam1_hook);
     mw_install_hooks(kOamYStaX, sizeof(kOamYStaX) / sizeof(kOamYStaX[0]),
                      mw_h2h_vw_oam_y_sta_x_hook);
     mw_install_hooks(kOamYStaY, sizeof(kOamYStaY) / sizeof(kOamYStaY[0]),
@@ -4518,20 +6088,25 @@ void MwDrawPpuFrameLocalFull(int local_slot) {
   }
 
   /*
-   * Stable half→full Y (no OAM focus).
-   * Cam-capture path stores pre-bias sy and applies y_oam at present.
-   * Fallback (tag/half cull) still uses biased staging + oam_delta.
-   * Snap to BG1 tile height so (cam_y_raw - y_bg) keeps the same fine
-   * phase — a non-multiple nudge slides $7F strips vs camera-locked OAM
-   * (moving ledges look ~1 tile off under the mech).
+   * Half→full Y recenter (no OAM focus) — only when vert-widen is OFF.
+   * Vert-widen already emits a ~224-tall window vs cam_raw (CMP→#$E0 /
+   * #$FF70 + staging +$78). Adding y_bg≈64 then pushes dual-bottom stage
+   * props (capture sy≈210–225) to ny≥224: brown leaves the strip, OAM
+   * either vanishes (skip_y) or an unshifted hack floats the stripe ~64px
+   * above the BG1 body. With vert-widen on, y_bg=y_oam=0 so OAM and BG1
+   * share cam_raw (aligned, platforms stay on-screen).
+   * Non-VW path: snap to the $7E:42B3 16px row bucket (not merely PPU
+   * tile height) so cam_y−y_bg stays on map phase — 8px-only snap left
+   * $C382 stripe vs brown ~1 tile apart.
    */
   enum { kMwH2hBgNudge = 8 };
+  enum { kMwH2hBgPhasePx = 16 }; /* match 42B3 (cam_y & ~15) */
   const int oam_bias = mw_h2h_oam_y_bias();
-  const int y_base = mw_h2h_full_frame_y_shift();
-  const int tile_px = (g_ppu && PPU_bigTiles(g_ppu, 0)) ? 16 : 8;
-  int y_bg = y_base + kMwH2hBgNudge;
-  if (tile_px > 0)
-    y_bg -= y_bg % tile_px;
+  int y_bg = 0;
+  if (!mw_h2h_vert_widen_armed()) {
+    y_bg = mw_h2h_full_frame_y_shift() + kMwH2hBgNudge;
+    y_bg -= y_bg % kMwH2hBgPhasePx;
+  }
   const int y_oam = y_bg;
   const uint16_t cam_y = mw_u16_sub_sat(cam_y_raw, y_bg);
   const int oam_delta = -oam_bias + y_oam;
@@ -4558,9 +6133,23 @@ void MwDrawPpuFrameLocalFull(int local_slot) {
     v1 = v0;
   }
 
+  if (!MwIsDualViewport())
+    mw_prop_home_reset();
+
   const int bg1_rebuild = mw_h2h_bg1_rebuild_armed();
   mw_present_rebuild_local_strips(cam_x, cam_y, h0, v0, h1, v1, bg1_rebuild,
                                   bg2_stream, cam_y_raw);
+  const uint16_t oth_x =
+      local_slot == 0
+          ? (s_nmi_latched ? s_nmi_cam2_x : mw_wram16(0x1E1Au))
+          : (s_nmi_latched ? s_nmi_cam_x : mw_wram16(0x1E16u));
+  const uint16_t oth_y =
+      local_slot == 0
+          ? (s_nmi_latched ? s_nmi_cam2_y : mw_wram16(0x1E1Cu))
+          : (s_nmi_latched ? s_nmi_cam_y : mw_wram16(0x1E18u));
+  /* Always suppress foreign movers (rebuild off still leaves $7F ghosts). */
+  mw_present_align_stage_prop_bg1(local_slot, cam_x, cam_y_raw, oth_x, oth_y,
+                                  h0, v0);
   mw_present_restamp_bg2_from_rom();
 
   uint16_t oam_backup[0x100];
@@ -4655,6 +6244,9 @@ void MwDrawPpuFrameLocalFull(int local_slot) {
 
   WsShadowFrame(g_ppu);
   mw_prefill_margins_from_map_ex(&cam_x, &cam_y, h0, v0, h1, v1);
+  /* Prefill/`$7F` east can repaint mover brown — re-hide after margins. */
+  mw_present_align_stage_prop_bg1(local_slot, cam_x, cam_y_raw, oth_x, oth_y,
+                                  h0, v0);
 
   static int logged;
   if (!logged) {
@@ -4681,6 +6273,8 @@ void MwDrawPpuFrameLocalFull(int local_slot) {
   memcpy(g_ppu->highOam, high_oam_backup, sizeof(high_oam_backup));
   mw_vram_restore();
   s_present_h2h_full_frame = 0;
+  /* Present-time dump has fresh sticky/present fields (NMI elev also ticks). */
+  mw_coldump_tick(local_slot);
 }
 
 /* LLE host execution cursor — not in snes_saveload (that blob holds the
@@ -4689,7 +6283,7 @@ void MwDrawPpuFrameLocalFull(int local_slot) {
  * Cleared by MwSessionReset on rematch (see soft-return sticky latch). */
 static bool s_lle_did_reset = false;
 static uint32_t s_lle_resume_pc = 0;
-static unsigned s_lle_host_frames = 0;
+/* s_lle_host_frames declared with coldump latch (above). */
 static bool s_lle_extra_loaded = false; /* set by state_load_extra */
 
 void MwSessionReset(void) {
@@ -4715,6 +6309,12 @@ void MwSessionReset(void) {
   s_oam_draw_cam = 0;
   s_oam_saw_adc78 = 0;
   mw_cam_oam_reset();
+  mw_prop_home_reset();
+  memset(s_coldump_mot_valid, 0, sizeof(s_coldump_mot_valid));
+  memset(s_coldump_bg_try, 0, sizeof(s_coldump_bg_try));
+  memset(s_coldump_bg_hit, 0, sizeof(s_coldump_bg_hit));
+  s_coldump_bg_slot = -1;
+  s_coldump_last_f = -1;
   s_spawn_left_34 = s_spawn_left_38 = 0;
   s_spawn_left_34_valid = s_spawn_left_38_valid = false;
   s_bg2_rom_valid_mask = 0;
