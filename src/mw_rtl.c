@@ -150,6 +150,9 @@ static int8_t s_cam_prop_owner[2][128];
  * culled them on the non-home peer (same class of bug as mech OAM cull).
  * Elevators `$D5B8` stay out (BG2 path). Add metas here when a new mover
  * needs isolation.
+ *
+ * Living catalog / coldump / manipulation notes:
+ *   docs/H2H_STAGE_PROPS.md
  */
 static int mw_is_stage_prop_meta(uint16_t meta) {
   switch (meta) {

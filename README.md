@@ -48,6 +48,8 @@ Debug TCP server listens on port **4380** (avoids collisions with SMW/Zelda/MMX)
 - `src/gen/` — recompiler output (local only; gitignored)
 - `snesrecomp/` — framework symlink
 - `tools/regen.sh` / `tools/build-linux.sh` — regen + Linux build
+- `docs/H2H_STAGE_PROPS.md` — H2H mover/platform identification & manipulation
+  (coldump fields, meta whitelist, OAM sticky + BG1 brown)
 
 ## Status
 
