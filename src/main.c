@@ -675,6 +675,19 @@ static void SdlRenderer_EndDraw(void) {
   SDL_RenderPresent(g_renderer); // vsyncs to 60 FPS?
 }
 
+/* Re-present last framebuffer without RtlDrawPpuFrame / MwDrawPpuFrameLocalFull. */
+static void PresentHeldNetplayFrame(void) {
+  if (g_config.output_method == kOutputMethod_OpenGL) {
+    g_renderer_funcs.EndDraw();
+    return;
+  }
+  if (!g_renderer || !g_texture)
+    return;
+  SDL_RenderClear(g_renderer);
+  SDL_RenderCopy(g_renderer, g_texture, &g_sdl_renderer_rect, NULL);
+  SDL_RenderPresent(g_renderer);
+}
+
 static const struct RendererFuncs kSdlRendererFuncs = {
   &SdlRenderer_Init,
   &SdlRenderer_Destroy,
@@ -1018,6 +1031,15 @@ int main(int argc, char** argv) {
             rom_path_buf, sizeof(rom_path_buf));
         RecompLauncherCNetplayLaunch net = ls.netplay_launch;
         if (lr == 1) {
+          /* Setup wizard persists rom.cfg; also write on quit so a path
+           * chosen this session is kept if the user never hit PLAY. */
+          if (rom_path_buf[0]) {
+            FILE *rc = fopen("rom.cfg", "w");
+            if (rc) {
+              fprintf(rc, "%s\n", rom_path_buf);
+              fclose(rc);
+            }
+          }
           snes_host_lobby_leave();
           host_report_breadcrumb("launcher: quit");
           return 0;
@@ -1514,32 +1536,44 @@ error_reading:;
      * come from keybinds.ini. */
     RefreshKeybindControllerBits();
 
-    uint32 inputs;
+    uint32 inputs = 0;
+    int netplay_held_present = 0;
     if (snes_netplay_active()) {
       g_turbo = 0;
       if (!NetplayBarrierAdmit(&running)) {
-        /* Stalled / left session — do not advance sim. */
         if (snes_netplay_return_to_lobby_requested() || !running)
           break;
-        continue;
-      }
-      inputs = snes_netplay_published_inputs() | snes_netplay_active_mask();
-      RtlRunFrame(inputs);
-      snes_netplay_finish_frame();
-      {
-        static int test_ticks = -1;
-        if (test_ticks < 0) {
-          const char *value = getenv("SNES_NET_TEST_TICKS");
-          test_ticks = value && value[0] ? atoi(value) : 0;
-        }
-        if (test_ticks > 0 &&
-            snes_netplay_sim_tick() >= (uint32_t)test_ticks) {
-          fprintf(stderr,
-                  "SNES_NET_TEST_PASS slot=%d tick=%u\n",
-                  snes_netplay_local_slot(),
-                  (unsigned)snes_netplay_sim_tick());
-          snes_netplay_shutdown();
-          running = false;
+        PresentHeldNetplayFrame();
+        netplay_held_present = 1;
+      } else {
+        int burst = 0;
+        for (;;) {
+          inputs = snes_netplay_published_inputs() | snes_netplay_active_mask();
+          RtlRunFrame(inputs);
+          snes_netplay_finish_frame();
+          {
+            static int test_ticks = -1;
+            if (test_ticks < 0) {
+              const char *value = getenv("SNES_NET_TEST_TICKS");
+              test_ticks = value && value[0] ? atoi(value) : 0;
+            }
+            if (test_ticks > 0 &&
+                snes_netplay_sim_tick() >= (uint32_t)test_ticks) {
+              fprintf(stderr,
+                      "SNES_NET_TEST_PASS slot=%d tick=%u\n",
+                      snes_netplay_local_slot(),
+                      (unsigned)snes_netplay_sim_tick());
+              snes_netplay_shutdown();
+              running = false;
+              break;
+            }
+          }
+          if (burst >= snes_host_catchup_budget())
+            break;
+          snes_netplay_stage_local(CaptureLocalNetplayButtons());
+          if (!snes_netplay_poll_admit())
+            break;
+          burst++;
         }
       }
     } else {
@@ -1581,7 +1615,9 @@ error_reading:;
       if (s_ft && !snes_netplay_active()) g_turbo = 1; }
     g_snes->disableRender = g_turbo && (frameCtr & 0xf) != 0;
 
-    if (!g_snes->disableRender) {
+    if (netplay_held_present) {
+      /* Stall: already re-presented last texture; do not re-sim PPU/H2H. */
+    } else if (!g_snes->disableRender) {
       DrawPpuFrameWithPerf();
     } else {
       /* Turbo (render skipped): draw_ppu_frame also simulates HDMA + fires the
