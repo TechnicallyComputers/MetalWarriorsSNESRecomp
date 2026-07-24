@@ -172,7 +172,7 @@ static void MwFillMatchCaps(void *ctx, const void *settings_v,
   out->widescreen = 1;
   out->widescreen_hud = 1;
   out->ignore_aspect = settings ? settings->ignore_aspect != 0 : 0;
-  out->input_delay = 2;
+  /* Preserve out->input_delay from default_caps (lobby waiting-room setting). */
   out->ws_extra = 71;
 }
 
