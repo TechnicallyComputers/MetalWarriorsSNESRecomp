@@ -125,7 +125,8 @@ if(NOT EXISTS "${RECOMP_UI_ROOT}/recomp_ui.cmake")
         "Run: git submodule update --init --recursive recomp-ui")
 endif()
 include(${RECOMP_UI_ROOT}/recomp_ui.cmake)
-recomp_target_launcher_ui(MetalWarriorsSNESRecomp)
+recomp_target_launcher_ui(MetalWarriorsSNESRecomp
+    BOXART ${CMAKE_SOURCE_DIR}/recomp/launcher/boxart.tga)
 
 # Delay-sync netplay + MotK lobby client (LAN by default; opt into ICE with
 # -DSNESRECOMP_NET_ICE=ON when libjuice is available).
