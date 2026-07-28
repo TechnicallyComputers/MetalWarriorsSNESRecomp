@@ -51,6 +51,7 @@ __pycache__/
 *.pyc
 
 # Release / package scratch
+dist/
 release-linux/
 release-stage/
 release-macos*/

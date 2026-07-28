@@ -1,0 +1,231 @@
+# Build Metal Warriors for Linux, Windows, macOS (arm64 + Intel).
+# Does not ship the SNES ROM in the player zip.
+#
+# Requires:
+#   - Secret CI_ASSETS_TOKEN: fine-grained PAT with Contents:Read on
+#     TechnicallyComputers/psxrecomp-ci-assets (same secret as MotK).
+#     That repo supplies metalwarriors/src-gen.zip (prebuilt src/gen/*.c).
+#     Refresh locally: bash tools/publish_ci_src_gen.sh
+#     No ROM is stored in CI assets. Players pick their own ROM at launch.
+#
+# Framework deps use this repository's exact gitlink pins:
+#   - snesrecomp at the game root (owns nested lib/recomp-net)
+#   - recomp-ui at the game root
+#
+# Triggers:
+#   - pull_request / push to main (compile + artifact upload)
+#   - workflow_dispatch (manual)
+#   - push tags matching v* (also publishes a GitHub Release)
+
+name: Build
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+concurrency:
+  group: mw-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CMAKE_BUILD_TYPE: Release
+
+jobs:
+  build:
+    name: ${{ matrix.artifact }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            artifact: linux-x64
+            shell: bash
+          - os: windows-2022
+            artifact: windows-x64
+            shell: 'msys2 {0}'
+          - os: macos-15
+            artifact: macos-arm64
+            shell: bash
+            deployment_target: '11.0'
+          - os: macos-15-intel
+            artifact: macos-x64
+            shell: bash
+            deployment_target: '11.0'
+
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Record pinned framework revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "snesrecomp=$(git -C snesrecomp rev-parse --short HEAD) ($(git -C snesrecomp rev-parse HEAD))"
+          echo "recomp-ui=$(git -C recomp-ui rev-parse --short HEAD)"
+          echo "recomp-net=$(git -C snesrecomp/lib/recomp-net rev-parse --short HEAD)"
+
+      - name: Fetch CI assets (src-gen only, no ROM)
+        uses: actions/checkout@v4
+        with:
+          repository: TechnicallyComputers/psxrecomp-ci-assets
+          token: ${{ secrets.CI_ASSETS_TOKEN }}
+          path: _ci-assets
+          fetch-depth: 1
+          # Small zip only — do not pull MotK LFS disc/BIOS blobs.
+          lfs: false
+
+      - name: Install generated C from src-gen.zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          ASSETS="_ci-assets"
+          if [[ ! -d "${ASSETS}" ]]; then
+            echo "::error::missing _ci-assets — set secret CI_ASSETS_TOKEN for TechnicallyComputers/psxrecomp-ci-assets"
+            exit 1
+          fi
+
+          GEN_ZIP=""
+          for cand in \
+              "${ASSETS}/metalwarriors/src-gen.zip" \
+              "${ASSETS}/metalwarriors-src-gen.zip"
+          do
+            if [[ -f "${cand}" ]]; then
+              GEN_ZIP="${cand}"
+              break
+            fi
+          done
+          if [[ -z "${GEN_ZIP}" ]]; then
+            echo "::error::metalwarriors/src-gen.zip missing in psxrecomp-ci-assets"
+            echo "Publish from a machine with a legal dump:"
+            echo "  bash tools/regen.sh --no-tests && bash tools/publish_ci_src_gen.sh"
+            find "${ASSETS}" -maxdepth 3 -type f | head -40 || true
+            exit 1
+          fi
+
+          mkdir -p src/gen
+          if command -v python3 >/dev/null 2>&1; then PY=python3; else PY=python; fi
+          GEN_ZIP="${GEN_ZIP}" "${PY}" - <<'PY'
+          import os
+          import zipfile
+          from pathlib import Path
+
+          zpath = Path(os.environ["GEN_ZIP"])
+          dest = Path("src/gen")
+          with zipfile.ZipFile(zpath) as zf:
+              zf.extractall(dest)
+          nested = dest / "src" / "gen"
+          if nested.is_dir():
+              for p in nested.iterdir():
+                  p.rename(dest / p.name)
+          banks = list(dest.glob("*.c"))
+          if not banks:
+              raise SystemExit(f"src-gen.zip had no .c files: {sorted(dest.iterdir())}")
+          print(f"Installed {len(banks)} generated .c files from {zpath} ({zpath.stat().st_size} bytes)")
+          PY
+
+      - name: Setup MSYS2 (Windows)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-SDL2
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-python
+            zip
+
+      - name: Install deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config \
+            libsdl2-dev libgl1-mesa-dev python3 zip
+
+      - name: Install deps (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install cmake ninja pkg-config sdl2 dylibbundler zip
+
+      - name: Configure & build
+        env:
+          CMAKE_OSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target || '' }}
+        run: |
+          set -euo pipefail
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          EXTRA=()
+          if [[ -n "${CMAKE_OSX_DEPLOYMENT_TARGET:-}" ]]; then
+            EXTRA+=("-DCMAKE_OSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}")
+          fi
+          JOBS="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+          cmake -S . -B build-ci -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSNESRECOMP_ENABLE_TRACE=OFF \
+            -DSNESRECOMP_NET_ICE=ON \
+            -DSNESRECOMP_BUILD_VERSION="${VERSION}" \
+            "${EXTRA[@]}"
+          cmake --build build-ci --target MetalWarriorsSNESRecomp -j"${JOBS}"
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          chmod +x scripts/package_release.sh
+          scripts/package_release.sh build-ci "${{ matrix.artifact }}"
+          ls -la dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: metalwarriors-${{ matrix.artifact }}
+          path: dist/metalwarriors-*-${{ matrix.artifact }}.zip
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: false
+
+      - name: Flatten zips
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find artifacts -type f -name 'metalwarriors-*.zip' -exec cp -v {} dist/ \;
+          ls -la dist/
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/metalwarriors-*.zip
+          generate_release_notes: true
+          fail_on_unmatched_files: true
