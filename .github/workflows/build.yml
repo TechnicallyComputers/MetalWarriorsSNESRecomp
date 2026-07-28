@@ -68,7 +68,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           submodules: recursive
           fetch-depth: 1
@@ -81,41 +81,43 @@ jobs:
           echo "recomp-ui=$(git -C recomp-ui rev-parse --short HEAD)"
           echo "recomp-net=$(git -C snesrecomp/lib/recomp-net rev-parse --short HEAD)"
 
-      - name: Fetch CI assets (src-gen only, no ROM)
-        uses: actions/checkout@v4
-        with:
-          repository: TechnicallyComputers/psxrecomp-ci-assets
-          token: ${{ secrets.CI_ASSETS_TOKEN }}
-          path: _ci-assets
-          fetch-depth: 1
-          # Small zip only — do not pull MotK LFS disc/BIOS blobs.
-          lfs: false
-
+      # Download only metalwarriors/src-gen.zip via the API (no full-repo
+      # checkout). Avoids actions/checkout failing with an empty token when
+      # CI_ASSETS_TOKEN is missing, and skips MotK LFS disc/BIOS blobs.
       - name: Install generated C from src-gen.zip
         shell: bash
+        env:
+          CI_ASSETS_TOKEN: ${{ secrets.CI_ASSETS_TOKEN }}
         run: |
           set -euo pipefail
-          ASSETS="_ci-assets"
-          if [[ ! -d "${ASSETS}" ]]; then
-            echo "::error::missing _ci-assets — set secret CI_ASSETS_TOKEN for TechnicallyComputers/psxrecomp-ci-assets"
+          if [[ -z "${CI_ASSETS_TOKEN}" ]]; then
+            echo "::error::Repository secret CI_ASSETS_TOKEN is missing or empty."
+            echo "Add a fine-grained PAT with Contents: Read on"
+            echo "  TechnicallyComputers/psxrecomp-ci-assets"
+            echo "(same secret MotK uses). Fork PRs cannot read this secret —"
+            echo "run the workflow from the main repo (push / workflow_dispatch)."
             exit 1
           fi
 
-          GEN_ZIP=""
-          for cand in \
-              "${ASSETS}/metalwarriors/src-gen.zip" \
-              "${ASSETS}/metalwarriors-src-gen.zip"
-          do
-            if [[ -f "${cand}" ]]; then
-              GEN_ZIP="${cand}"
-              break
-            fi
-          done
-          if [[ -z "${GEN_ZIP}" ]]; then
-            echo "::error::metalwarriors/src-gen.zip missing in psxrecomp-ci-assets"
-            echo "Publish from a machine with a legal dump:"
-            echo "  bash tools/regen.sh --no-tests && bash tools/publish_ci_src_gen.sh"
-            find "${ASSETS}" -maxdepth 3 -type f | head -40 || true
+          ASSET_URL="https://api.github.com/repos/TechnicallyComputers/psxrecomp-ci-assets/contents/metalwarriors/src-gen.zip"
+          GEN_ZIP="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/mw-src-gen.zip"
+          # Do not use curl -f: we need the HTTP status for a clear error.
+          HTTP_CODE="$(curl -sS -L -o "${GEN_ZIP}" -w '%{http_code}' \
+            -H "Authorization: Bearer ${CI_ASSETS_TOKEN}" \
+            -H "Accept: application/vnd.github.raw" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "${ASSET_URL}" || echo "000")"
+          if [[ "${HTTP_CODE}" != "200" ]]; then
+            echo "::error::failed to download metalwarriors/src-gen.zip (HTTP ${HTTP_CODE})"
+            echo "Check CI_ASSETS_TOKEN Contents:Read on psxrecomp-ci-assets, and that"
+            echo "metalwarriors/src-gen.zip exists (bash tools/publish_ci_src_gen.sh)."
+            rm -f "${GEN_ZIP}"
+            exit 1
+          fi
+          SZ="$(wc -c < "${GEN_ZIP}" | tr -d '[:space:]')"
+          if [[ "${SZ}" -lt 100 ]]; then
+            echo "::error::src-gen.zip is only ${SZ} bytes — download looks wrong"
+            rm -f "${GEN_ZIP}"
             exit 1
           fi
 
@@ -137,8 +139,9 @@ jobs:
           banks = list(dest.glob("*.c"))
           if not banks:
               raise SystemExit(f"src-gen.zip had no .c files: {sorted(dest.iterdir())}")
-          print(f"Installed {len(banks)} generated .c files from {zpath} ({zpath.stat().st_size} bytes)")
+          print(f"Installed {len(banks)} generated .c files ({zpath.stat().st_size} bytes)")
           PY
+          rm -f "${GEN_ZIP}"
 
       - name: Setup MSYS2 (Windows)
         if: runner.os == 'Windows'
@@ -195,7 +198,7 @@ jobs:
           ls -la dist/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: metalwarriors-${{ matrix.artifact }}
           path: dist/metalwarriors-*-${{ matrix.artifact }}.zip
@@ -211,7 +214,7 @@ jobs:
       contents: write
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           path: artifacts
           merge-multiple: false
