@@ -70,8 +70,9 @@ add_executable(MetalWarriorsSNESRecomp
     ${MW_GEN_SOURCES}
 )
 
+# Do not add ${CMAKE_SOURCE_DIR} itself: on case-insensitive macOS volumes the
+# VERSION pin file shadows the C++ standard <version> header and breaks ImGui.
 target_include_directories(MetalWarriorsSNESRecomp PRIVATE
-    ${CMAKE_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/recomp
     ${SNESRECOMP_RUNNER_INCLUDE_DIRS}
