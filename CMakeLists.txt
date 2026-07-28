@@ -72,9 +72,11 @@ add_executable(MetalWarriorsSNESRecomp
 
 # Do not add ${CMAKE_SOURCE_DIR} itself: on case-insensitive macOS volumes the
 # VERSION pin file shadows the C++ standard <version> header and breaks ImGui.
+# third_party/ is enough for "gl_core/..." and "stb/..." includes.
 target_include_directories(MetalWarriorsSNESRecomp PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/recomp
+    ${CMAKE_SOURCE_DIR}/third_party
     ${SNESRECOMP_RUNNER_INCLUDE_DIRS}
     ${SDL2_INCLUDE_DIRS}
 )
