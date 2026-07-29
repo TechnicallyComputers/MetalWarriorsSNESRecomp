@@ -534,7 +534,8 @@ void RtlDrawPpuFrame(uint8 *pixel_buffer, size_t pitch, uint32 render_flags) {
 }
 
 static void DrawPpuFrameWithPerf(void) {
-  int render_scale = PpuGetCurrentRenderScale(g_ppu, g_ppu_render_flags);
+  /* snesrecomp retired PpuGetCurrentRenderScale (always 1). */
+  const int render_scale = 1;
   uint8 *pixel_buffer = 0;
   int pitch = 0;
 
