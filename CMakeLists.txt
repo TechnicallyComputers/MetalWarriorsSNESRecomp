@@ -129,6 +129,7 @@ if(NOT EXISTS "${RECOMP_UI_ROOT}/recomp_ui.cmake")
 endif()
 include(${RECOMP_UI_ROOT}/recomp_ui.cmake)
 recomp_target_launcher_ui(MetalWarriorsSNESRecomp
+    CONSOLE snes
     BOXART ${CMAKE_SOURCE_DIR}/recomp/launcher/boxart.tga)
 
 # Delay-sync netplay + MotK lobby client (LAN by default; opt into ICE with
