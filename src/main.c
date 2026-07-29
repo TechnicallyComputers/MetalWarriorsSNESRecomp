@@ -1139,8 +1139,9 @@ int main(int argc, char** argv) {
   // A wider viewport can expose more sprites on one scanline than the SNES
   // could see at 256px. Keep authentic caps configurable at 4:3, but lift them
   // whenever widescreen is active so sprites do not disappear prematurely.
+  // Height240 flag was removed from snesrecomp; viewport stays 224 (see
+  // g_snes_height above). Match runner desktop host (mmx23_host_main.inc).
   g_ppu_render_flags = g_config.new_renderer * kPpuRenderFlags_NewRenderer |
-    g_config.extend_y * kPpuRenderFlags_Height240 |
     (g_config.no_sprite_limits || g_ws_active) *
       kPpuRenderFlags_NoSpriteLimits;
 
@@ -1241,7 +1242,6 @@ session_reboot:
   g_snes_width = 256 + 2 * g_ws_extra;
   g_ppu_render_flags =
       g_config.new_renderer * kPpuRenderFlags_NewRenderer |
-      g_config.extend_y * kPpuRenderFlags_Height240 |
       (g_config.no_sprite_limits || g_ws_active) *
           kPpuRenderFlags_NoSpriteLimits;
   if (!custom_size) {
