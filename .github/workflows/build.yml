@@ -182,8 +182,10 @@ jobs:
             EXTRA+=("-DCMAKE_OSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}")
           fi
           JOBS="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+          # SDL2: MW host is not SDL3-ported yet; snesrecomp defaults to SDL3.
           cmake -S . -B build-ci -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            -DSNESRECOMP_SDL_BACKEND=SDL2 \
             -DSNESRECOMP_ENABLE_TRACE=OFF \
             -DSNESRECOMP_NET_ICE=ON \
             -DSNESRECOMP_BUILD_VERSION="${VERSION}" \

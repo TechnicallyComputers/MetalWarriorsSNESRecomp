@@ -24,6 +24,10 @@ message(STATUS "Metal Warriors lobby game_version: ${SNESRECOMP_BUILD_VERSION} (
 # (`git submodule update --init --recursive`), the generated C in src/gen/
 # (run `bash tools/regen.sh` with a verified metalwarriors.sfc at the repo
 # root), and SDL2 (e.g. `apt install libsdl2-dev`).
+#
+# snesrecomp defaults to SDL3 for new hosts, but this game's src/main.c /
+# opengl.c are still SDL2-shaped. Stay on the explicit SDL2 fallback until
+# that port lands (recomp-ui follows SNESRECOMP_SDL_BACKEND).
 
 set(CMAKE_C_STANDARD 11)
 
@@ -31,17 +35,11 @@ set(SNESRECOMP_ROOT "${CMAKE_SOURCE_DIR}/snesrecomp" CACHE PATH
     "Path to the snesrecomp checkout used by this game")
 option(SNESRECOMP_NET_ICE
     "Enable ICE/libjuice for Metal Warriors internet netplay" OFF)
+set(SNESRECOMP_SDL_BACKEND "SDL2" CACHE STRING
+    "Desktop SDL backend (SDL3 or SDL2)")
 include(${SNESRECOMP_ROOT}/runner/runner.cmake)
 
-find_package(SDL2 REQUIRED)
 find_package(OpenGL REQUIRED)
-
-# MinGW's SDL2 package includes SDL2main by default, but this game provides a
-# plain main() and uses the CRT entry point. Linking the forwarding shim would
-# instead require SDL_main().
-if(WIN32)
-    list(FILTER SDL2_LIBRARIES EXCLUDE REGEX "SDL2main")
-endif()
 
 # Generated recompiler output (produced by tools/regen.sh; not committed).
 file(GLOB MW_GEN_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/gen/*.c)
@@ -78,7 +76,6 @@ target_include_directories(MetalWarriorsSNESRecomp PRIVATE
     ${CMAKE_SOURCE_DIR}/recomp
     ${CMAKE_SOURCE_DIR}/third_party
     ${SNESRECOMP_RUNNER_INCLUDE_DIRS}
-    ${SDL2_INCLUDE_DIRS}
 )
 
 # prod-vs-debug via the single SNESRECOMP_ENABLE_TRACE switch (runner.cmake,
@@ -107,8 +104,10 @@ if(NOT MSVC)
         $<$<COMPILE_LANGUAGE:C>:-Wno-implicit-function-declaration>)
 endif()
 
+# SDL2/SDL3 discovery + link (and recomp-ui LNG_SDL3) via runner helper.
+snesrecomp_target_sdl(MetalWarriorsSNESRecomp)
+
 target_link_libraries(MetalWarriorsSNESRecomp PRIVATE
-    ${SDL2_LIBRARIES}
     OpenGL::GL
     m                                 # libm: glsl_shader.c uses pow() (implicit on macOS)
 )
