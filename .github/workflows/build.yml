@@ -153,7 +153,7 @@ jobs:
             mingw-w64-x86_64-toolchain
             mingw-w64-x86_64-cmake
             mingw-w64-x86_64-ninja
-            mingw-w64-x86_64-SDL2
+            mingw-w64-x86_64-SDL3
             mingw-w64-x86_64-pkgconf
             mingw-w64-x86_64-python
             zip
@@ -164,12 +164,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake ninja-build pkg-config \
-            libsdl2-dev libgl1-mesa-dev python3 zip
+            libsdl3-dev libgl1-mesa-dev python3 zip
 
       - name: Install deps (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install cmake ninja pkg-config sdl2 dylibbundler zip
+          brew install cmake ninja pkg-config sdl3 dylibbundler zip
 
       - name: Configure & build
         env:
@@ -182,10 +182,8 @@ jobs:
             EXTRA+=("-DCMAKE_OSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}")
           fi
           JOBS="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
-          # SDL2: MW host is not SDL3-ported yet; snesrecomp defaults to SDL3.
           cmake -S . -B build-ci -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DSNESRECOMP_SDL_BACKEND=SDL2 \
             -DSNESRECOMP_ENABLE_TRACE=OFF \
             -DSNESRECOMP_NET_ICE=ON \
             -DSNESRECOMP_BUILD_VERSION="${VERSION}" \

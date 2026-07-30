@@ -109,7 +109,7 @@ bundle_mingw_dlls() {
   ) || true
 
   needed+=(
-    SDL2.dll
+    SDL3.dll
     libgcc_s_seh-1.dll
     libstdc++-6.dll
     libwinpthread-1.dll
@@ -159,7 +159,7 @@ fi
 if [[ "$(uname -s)" == "Darwin" ]] && command -v dylibbundler >/dev/null 2>&1; then
   mkdir -p "${STAGE}/libs"
   dylibbundler -od -b -x "${STAGE_EXE}" -d "${STAGE}/libs" -p "@executable_path/libs/" \
-    || echo "warning: dylibbundler failed; macOS zip may need Homebrew SDL2" >&2
+    || echo "warning: dylibbundler failed; macOS zip may need Homebrew SDL3" >&2
 fi
 
 cat > "${STAGE}/README.txt" <<EOF

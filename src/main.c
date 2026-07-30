@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "debug_server.h"
-#include <SDL.h>
+#include "desktop/sdl_compat.h"
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -64,7 +64,12 @@ typedef struct GamepadInfo {
 } GamepadInfo;
 
 
+#if SNESRECOMP_SDL3
+static void SDLCALL AudioStreamCallback(void *userdata, SDL_AudioStream *stream,
+                                        int additional_amount, int total_amount);
+#else
 static void SDLCALL AudioCallback(void *userdata, Uint8 *stream, int len);
+#endif
 static void EnsureConfigIni(void);
 #if defined(RECOMP_LAUNCHER)
 static int FindLauncherAssetsDir(char *out, size_t cap);
@@ -145,7 +150,7 @@ static bool g_display_perf;
 static int g_curr_fps;
 static int g_ppu_render_flags = 0;
 static int g_snes_width, g_snes_height;
-static int g_sdl_audio_mixer_volume = SDL_MIX_MAXVOLUME;
+static int g_sdl_audio_mixer_volume = SNESRECOMP_SDL_MIX_MAXVOLUME;
 static struct RendererFuncs g_renderer_funcs;
 
 static GamepadInfo g_gamepad[2];
@@ -343,17 +348,15 @@ static GamepadInfo *GetGamepadInfo(SDL_JoystickID id) {
 }
 
 void ChangeWindowScale(int scale_step) {
-  if ((SDL_GetWindowFlags(g_window) & (SDL_WINDOW_FULLSCREEN_DESKTOP | SDL_WINDOW_FULLSCREEN | SDL_WINDOW_MINIMIZED | SDL_WINDOW_MAXIMIZED)) != 0)
+  if ((SDL_GetWindowFlags(g_window) & (SNESRECOMP_SDL_WINDOW_FULLSCREEN_DESKTOP | SDL_WINDOW_FULLSCREEN | SDL_WINDOW_MINIMIZED | SDL_WINDOW_MAXIMIZED)) != 0)
     return;
-  int screen = SDL_GetWindowDisplayIndex(g_window);
-  if (screen < 0) screen = 0;
   int max_scale = kMaxWindowScale;
   SDL_Rect bounds;
   int bt = -1, bl, bb, br;
   // note this takes into effect Windows display scaling, i.e., resolution is divided by scale factor
-  if (SDL_GetDisplayUsableBounds(screen, &bounds) == 0) {
+  if (snesrecomp_sdl_get_display_usable_bounds(g_window, &bounds)) {
     // this call may take a while before it is reported by Windows (or not at all in my testing)
-    if (SDL_GetWindowBordersSize(g_window, &bt, &bl, &bb, &br) != 0) {
+    if (!snesrecomp_sdl_get_window_borders_size(g_window, &bt, &bl, &bb, &br)) {
       // guess based on Windows 10/11 defaults
       bl = br = bb = 1;
       bt = 31;
@@ -368,12 +371,11 @@ void ChangeWindowScale(int scale_step) {
   int w = new_scale * g_snes_width;
   int h = new_scale * g_snes_height;
 
-  //SDL_RenderSetLogicalSize(g_renderer, w, h);
   SDL_SetWindowSize(g_window, w, h);
   if (bt >= 0) {
     // Center the window on top of the mouse
     int mx, my;
-    SDL_GetGlobalMouseState(&mx, &my);
+    snesrecomp_sdl_get_global_mouse_state(&mx, &my);
     int wx = IntMax(IntMin(mx - w / 2, bounds.x + bounds.w - bl - br - w), bounds.x + bl);
     int wy = IntMax(IntMin(my - h / 2, bounds.y + bounds.h - bt - bb - h), bounds.y + bt);
     SDL_SetWindowPosition(g_window, wx, wy);
@@ -385,7 +387,7 @@ void ChangeWindowScale(int scale_step) {
 #define RESIZE_BORDER 20
 static SDL_HitTestResult HitTestCallback(SDL_Window *win, const SDL_Point *pt, void *data) {
   uint32 flags = SDL_GetWindowFlags(win);
-  if ((flags & SDL_WINDOW_FULLSCREEN_DESKTOP) != 0 || (flags & SDL_WINDOW_FULLSCREEN) != 0)
+  if ((flags & SNESRECOMP_SDL_WINDOW_FULLSCREEN_DESKTOP) != 0 || (flags & SDL_WINDOW_FULLSCREEN) != 0)
     return SDL_HITTEST_NORMAL;
 
   if ((SDL_GetModState() & KMOD_CTRL) != 0)
@@ -567,6 +569,9 @@ static uint8 *g_audiobuffer, *g_audiobuffer_cur, *g_audiobuffer_end;
 static int g_frames_per_block;
 static uint8 g_audio_channels;
 static SDL_AudioDeviceID g_audio_device;
+#if SNESRECOMP_SDL3
+static SDL_AudioStream *g_audio_stream;
+#endif
 
 void RtlApuLock(void) {
   SDL_LockMutex(g_audio_mutex);
@@ -576,13 +581,13 @@ void RtlApuUnlock(void) {
   SDL_UnlockMutex(g_audio_mutex);
 }
 
-static void SDLCALL AudioCallback(void *userdata, Uint8 *stream, int len) {
+static void AudioCallbackFill(Uint8 *stream, int len) {
   /* Boot-stage marker: proves the audio thread reached the mixer at
    * least once (the "crashed before the first sound" class of report). */
   static SDL_atomic_t first_cb;
   if (SDL_AtomicCAS(&first_cb, 0, 1))
     host_report_breadcrumb("first audio callback (len=%d)", len);
-  if (SDL_LockMutex(g_audio_mutex)) Die("Mutex lock failed!");
+  if (!snesrecomp_sdl_lock_mutex(g_audio_mutex)) Die("Mutex lock failed!");
   while (len != 0) {
     if (g_audiobuffer_end - g_audiobuffer_cur == 0) {
       RtlRenderAudio((int16 *)g_audiobuffer, g_frames_per_block, g_audio_channels);
@@ -590,11 +595,11 @@ static void SDLCALL AudioCallback(void *userdata, Uint8 *stream, int len) {
       g_audiobuffer_end = g_audiobuffer + g_frames_per_block * g_audio_channels * sizeof(int16);
     }
     int n = IntMin(len, g_audiobuffer_end - g_audiobuffer_cur);
-    if (g_sdl_audio_mixer_volume == SDL_MIX_MAXVOLUME) {
+    if (g_sdl_audio_mixer_volume == SNESRECOMP_SDL_MIX_MAXVOLUME) {
       memcpy(stream, g_audiobuffer_cur, n);
     } else {
       SDL_memset(stream, 0, n);
-      SDL_MixAudioFormat(stream, g_audiobuffer_cur, AUDIO_S16, n, g_sdl_audio_mixer_volume);
+      snesrecomp_sdl_mix_audio(stream, g_audiobuffer_cur, n, g_sdl_audio_mixer_volume);
     }
     g_audiobuffer_cur += n;
     stream += n;
@@ -602,6 +607,28 @@ static void SDLCALL AudioCallback(void *userdata, Uint8 *stream, int len) {
   }
   SDL_UnlockMutex(g_audio_mutex);
 }
+
+#if SNESRECOMP_SDL3
+static void SDLCALL AudioStreamCallback(void *userdata, SDL_AudioStream *stream,
+                                        int additional_amount, int total_amount) {
+  Uint8 *buf;
+  (void)userdata;
+  (void)total_amount;
+  if (additional_amount <= 0)
+    return;
+  buf = (Uint8 *)SDL_malloc((size_t)additional_amount);
+  if (!buf)
+    return;
+  AudioCallbackFill(buf, additional_amount);
+  SDL_PutAudioStreamData(stream, buf, additional_amount);
+  SDL_free(buf);
+}
+#else
+static void SDLCALL AudioCallback(void *userdata, Uint8 *stream, int len) {
+  (void)userdata;
+  AudioCallbackFill(stream, len);
+}
+#endif
 
 
 // State for sdl renderer
@@ -613,26 +640,20 @@ static bool SdlRenderer_Init(SDL_Window *window) {
   if (g_config.shader)
     fprintf(stderr, "Warning: Shaders are supported only with the OpenGL backend\n");
 
-  SDL_Renderer *renderer = SDL_CreateRenderer(g_window, -1,
-                                              g_config.output_method == kOutputMethod_SDLSoftware ? SDL_RENDERER_SOFTWARE :
-                                              SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+  bool software = g_config.output_method == kOutputMethod_SDLSoftware;
+  SDL_Renderer *renderer =
+      snesrecomp_sdl_create_renderer(g_window, software, !software);
   if (renderer == NULL) {
     printf("Failed to create renderer: %s\n", SDL_GetError());
     return false;
   }
-  SDL_RendererInfo renderer_info;
-  SDL_GetRendererInfo(renderer, &renderer_info);
   if (kDebugFlag) {
-    printf("Supported texture formats:");
-    for (Uint32 i = 0; i < renderer_info.num_texture_formats; i++)
-      printf(" %s", SDL_GetPixelFormatName(renderer_info.texture_formats[i]));
-    printf("\n");
+    const char *name = snesrecomp_sdl_renderer_name(renderer);
+    printf("SDL renderer: %s\n", name ? name : "(unknown)");
   }
   g_renderer = renderer;
   if (!g_config.ignore_aspect_ratio)
-    SDL_RenderSetLogicalSize(renderer, g_snes_width, g_snes_height);
-  if (g_config.linear_filtering)
-    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "best");
+    snesrecomp_sdl_set_render_logical_size(renderer, g_snes_width, g_snes_height);
 
   int tex_mult = 1;
   g_texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
@@ -641,6 +662,8 @@ static bool SdlRenderer_Init(SDL_Window *window) {
     printf("Failed to create texture: %s\n", SDL_GetError());
     return false;
   }
+  snesrecomp_sdl_set_texture_opaque(g_texture);
+  snesrecomp_sdl_set_texture_linear(g_texture, g_config.linear_filtering);
   return true;
 }
 
@@ -650,7 +673,7 @@ static void SdlRenderer_Destroy(void) {
 }
 
 static void SdlRenderer_GetOutputSize(int *width, int *height) {
-  if (SDL_GetRendererOutputSize(g_renderer, width, height) != 0) {
+  if (!snesrecomp_sdl_get_render_output_size(g_renderer, width, height)) {
     *width = 0;
     *height = 0;
   }
@@ -659,20 +682,16 @@ static void SdlRenderer_GetOutputSize(int *width, int *height) {
 static void SdlRenderer_BeginDraw(int width, int height, uint8 **pixels, int *pitch) {
   g_sdl_renderer_rect.w = width;
   g_sdl_renderer_rect.h = height;
-  if (SDL_LockTexture(g_texture, &g_sdl_renderer_rect, (void **)pixels, pitch) != 0) {
+  if (!snesrecomp_sdl_lock_texture(g_texture, &g_sdl_renderer_rect, (void **)pixels, pitch)) {
     printf("Failed to lock texture: %s\n", SDL_GetError());
     return;
   }
 }
 
 static void SdlRenderer_EndDraw(void) {
-  //  uint64 before = SDL_GetPerformanceCounter();
   SDL_UnlockTexture(g_texture);
-  //  uint64 after = SDL_GetPerformanceCounter();
-  //  float v = (double)(after - before) / SDL_GetPerformanceFrequency();
-  //  printf("%f ms\n", v * 1000);
   SDL_RenderClear(g_renderer);
-  SDL_RenderCopy(g_renderer, g_texture, &g_sdl_renderer_rect, NULL);
+  snesrecomp_sdl_render_texture(g_renderer, g_texture, &g_sdl_renderer_rect, NULL);
   SDL_RenderPresent(g_renderer); // vsyncs to 60 FPS?
 }
 
@@ -685,7 +704,7 @@ static void PresentHeldNetplayFrame(void) {
   if (!g_renderer || !g_texture)
     return;
   SDL_RenderClear(g_renderer);
-  SDL_RenderCopy(g_renderer, g_texture, &g_sdl_renderer_rect, NULL);
+  snesrecomp_sdl_render_texture(g_renderer, g_texture, &g_sdl_renderer_rect, NULL);
   SDL_RenderPresent(g_renderer);
 }
 
@@ -1147,7 +1166,7 @@ int main(int argc, char** argv) {
       kPpuRenderFlags_NoSpriteLimits;
 
   if (g_config.fullscreen == 1)
-    g_win_flags ^= SDL_WINDOW_FULLSCREEN_DESKTOP;
+    g_win_flags ^= SNESRECOMP_SDL_WINDOW_FULLSCREEN_DESKTOP;
   else if (g_config.fullscreen == 2)
     g_win_flags ^= SDL_WINDOW_FULLSCREEN;
 
@@ -1172,7 +1191,7 @@ int main(int argc, char** argv) {
   SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
 
   // set up SDL
-  if(SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) {
+  if (!snesrecomp_sdl_init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER)) {
     host_report_breadcrumb("SDL_Init FAILED: %s", SDL_GetError());
     printf("Failed to init SDL: %s\n", SDL_GetError());
     return 1;
@@ -1297,7 +1316,8 @@ error_reading:;
   g_paused = 0;
   g_turbo = 0;
 
-  SDL_Window *window = SDL_CreateWindow(kWindowTitle, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, window_width, window_height, g_win_flags);
+  SDL_Window *window = snesrecomp_sdl_create_window(
+      kWindowTitle, window_width, window_height, g_win_flags);
   if(window == NULL) {
     host_report_breadcrumb("SDL_CreateWindow FAILED: %s", SDL_GetError());
     printf("Failed to create window: %s\n", SDL_GetError());
@@ -1329,9 +1349,42 @@ error_reading:;
   host_report_breadcrumb("SPC player initialized");
 
   if (g_config.enable_audio) {
-    /* Enumerate output devices into the breadcrumb ring: which device
-     * SDL picks (and what else was available) is exactly the per-machine
-     * variable a non-reproducible audio/boot crash report needs. */
+    SDL_AudioSpec want = { 0 };
+    want.freq = g_config.audio_freq;
+#if SNESRECOMP_SDL3
+    want.format = SDL_AUDIO_S16;
+#else
+    want.format = AUDIO_S16;
+#endif
+    want.channels = 2;
+#if SNESRECOMP_SDL3
+    {
+      int ndev = 0;
+      SDL_AudioDeviceID *devs = SDL_GetAudioPlaybackDevices(&ndev);
+      host_report_breadcrumb("audio outputs: %d device(s)", ndev);
+      for (int i = 0; i < ndev && i < 8; i++) {
+        const char *name = SDL_GetAudioDeviceName(devs[i]);
+        host_report_breadcrumb("audio output[%d]: %s", i,
+                               name ? name : "(null)");
+      }
+      SDL_free(devs);
+    }
+    g_audio_stream = SDL_OpenAudioDeviceStream(
+        SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &want, AudioStreamCallback, NULL);
+    if (!g_audio_stream) {
+      host_report_breadcrumb("audio device open FAILED: %s", SDL_GetError());
+      printf("Failed to open audio device: %s\n", SDL_GetError());
+      return 1;
+    }
+    g_audio_device = SDL_GetAudioStreamDevice(g_audio_stream);
+    g_audio_channels = 2;
+    g_frames_per_block = (534 * want.freq + 32040 / 2) / 32040;
+    g_audiobuffer = (uint8 *)calloc(g_frames_per_block * want.channels * sizeof(int16), 1);
+    snesrecomp_sdl_pause_audio_device(g_audio_device, false);
+    host_report_breadcrumb(
+        "audio device opened: freq=%d ch=%d frames_per_block=%d",
+        want.freq, want.channels, g_frames_per_block);
+#else
     {
       int ndev = SDL_GetNumAudioDevices(0);
       host_report_breadcrumb("audio outputs: %d device(s)", ndev);
@@ -1339,10 +1392,7 @@ error_reading:;
         host_report_breadcrumb("audio output[%d]: %s", i,
                                SDL_GetAudioDeviceName(i, 0));
     }
-    SDL_AudioSpec want = { 0 }, have;
-    want.freq = g_config.audio_freq;
-    want.format = AUDIO_S16;
-    want.channels = 2;
+    SDL_AudioSpec have;
     want.samples = g_config.audio_samples;
     want.callback = &AudioCallback;
     g_audio_device = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
@@ -1363,6 +1413,7 @@ error_reading:;
     host_report_breadcrumb(
         "audio device opened: freq=%d (want %d) ch=%d samples=%d frames_per_block=%d",
         have.freq, want.freq, have.channels, have.samples, g_frames_per_block);
+#endif
   } else {
     host_report_breadcrumb("audio disabled in config");
   }
@@ -1376,6 +1427,20 @@ error_reading:;
   RtlReadSram();
 
   {
+#if SNESRECOMP_SDL3
+    int njs = 0;
+    SDL_JoystickID *pads = SDL_GetGamepads(&njs);
+    printf("[Gamepad] SDL reports %d gamepad(s) at startup. "
+           "enable_gamepad=[%d,%d]\n",
+           njs, g_config.enable_gamepad[0], g_config.enable_gamepad[1]);
+    for (int i = 0; i < njs; i++) {
+      const char *name = SDL_GetGamepadNameForID(pads[i]);
+      printf("[Gamepad]   #%d name=%s is_game_controller=1\n",
+             i, name ? name : "(null)");
+      OpenOneGamepad((int)pads[i]);
+    }
+    SDL_free(pads);
+#else
     int njs = SDL_NumJoysticks();
     printf("[Gamepad] SDL reports %d joystick(s) at startup. "
            "enable_gamepad=[%d,%d]\n",
@@ -1387,6 +1452,7 @@ error_reading:;
              i, name ? name : "(null)", is_gc);
       OpenOneGamepad(i);
     }
+#endif
     if (njs == 0) {
       printf("[Gamepad] No joysticks detected. "
              "On Windows, plug controller in BEFORE launching, "
@@ -1440,25 +1506,26 @@ error_reading:;
     while (SDL_PollEvent(&event)) {
       switch (event.type) {
       case SDL_CONTROLLERDEVICEADDED:
-        OpenOneGamepad(event.cdevice.which);
+        OpenOneGamepad(SNESRECOMP_SDL_EVENT_DEVICE(event));
         break;
       case SDL_CONTROLLERDEVICEREMOVED:
-        gi = GetGamepadInfo(event.cdevice.which);
+        gi = GetGamepadInfo(SNESRECOMP_SDL_EVENT_DEVICE(event));
         if (gi) {
           memset(gi, 0, sizeof(GamepadInfo));
           gi->joystick_id = -1;
         }
         break;
       case SDL_CONTROLLERAXISMOTION:
-        gi = GetGamepadInfo(event.caxis.which);
+        gi = GetGamepadInfo(SNESRECOMP_SDL_EVENT_AXIS_DEVICE(event));
         if (gi)
-          HandleGamepadAxisInput(gi, event.caxis.axis, event.caxis.value);
+          HandleGamepadAxisInput(gi, SNESRECOMP_SDL_EVENT_AXIS(event),
+                                 SNESRECOMP_SDL_EVENT_AXIS_VALUE(event));
         break;
       case SDL_CONTROLLERBUTTONDOWN:
       case SDL_CONTROLLERBUTTONUP: {
-        gi = GetGamepadInfo(event.cbutton.which);
+        gi = GetGamepadInfo(SNESRECOMP_SDL_EVENT_BUTTON_DEVICE(event));
         if (gi) {
-          int b = RemapSdlButton(event.cbutton.button);
+          int b = RemapSdlButton(SNESRECOMP_SDL_EVENT_BUTTON(event));
           if (b >= 0)
             HandleGamepadInput(gi, b, event.type == SDL_CONTROLLERBUTTONDOWN);
         }
@@ -1469,24 +1536,24 @@ error_reading:;
           ChangeWindowScale(event.wheel.y > 0 ? 1 : -1);
         break;
       case SDL_MOUSEBUTTONDOWN:
-        if (event.button.button == SDL_BUTTON_LEFT && event.button.state == SDL_PRESSED && event.button.clicks == 2) {
-          if ((g_win_flags & SDL_WINDOW_FULLSCREEN_DESKTOP) == 0 && (g_win_flags & SDL_WINDOW_FULLSCREEN) == 0 && SDL_GetModState() & KMOD_SHIFT) {
+        if (event.button.button == SDL_BUTTON_LEFT && event.button.clicks == 2) {
+          if ((g_win_flags & SNESRECOMP_SDL_WINDOW_FULLSCREEN_DESKTOP) == 0 && (g_win_flags & SDL_WINDOW_FULLSCREEN) == 0 && SDL_GetModState() & KMOD_SHIFT) {
             g_win_flags ^= SDL_WINDOW_BORDERLESS;
-            SDL_SetWindowBordered(g_window, (g_win_flags & SDL_WINDOW_BORDERLESS) == 0 ? SDL_TRUE : SDL_FALSE);
+            SDL_SetWindowBordered(g_window, (g_win_flags & SDL_WINDOW_BORDERLESS) == 0);
           }
         }
         break;
       case SDL_KEYDOWN:
-        if (snes_netplay_active() && event.key.keysym.sym == SDLK_ESCAPE) {
+        if (snes_netplay_active() && SNESRECOMP_SDL_EVENT_KEY(event) == SDLK_ESCAPE) {
           netplay_soft_exit("escape");
           if (snes_netplay_return_to_lobby_requested())
             running = false;
           break;
         }
-        HandleInput(event.key.keysym.sym, event.key.keysym.mod, true);
+        HandleInput(SNESRECOMP_SDL_EVENT_KEY(event), SNESRECOMP_SDL_EVENT_MOD(event), true);
         break;
       case SDL_KEYUP:
-        HandleInput(event.key.keysym.sym, event.key.keysym.mod, false);
+        HandleInput(SNESRECOMP_SDL_EVENT_KEY(event), SNESRECOMP_SDL_EVENT_MOD(event), false);
         break;
       case SDL_QUIT:
         if (snes_netplay_active())
@@ -1504,7 +1571,7 @@ error_reading:;
     if (g_paused != audiopaused) {
       audiopaused = g_paused;
       if (g_audio_device)
-        SDL_PauseAudioDevice(g_audio_device, audiopaused);
+        snesrecomp_sdl_pause_audio_device(g_audio_device, audiopaused);
     }
 
     if (g_paused) {
@@ -1664,8 +1731,17 @@ error_reading:;
   RtlWriteSram();
 
   if (g_audio_device) {
-    SDL_PauseAudioDevice(g_audio_device, 1);
+    snesrecomp_sdl_pause_audio_device(g_audio_device, true);
+#if SNESRECOMP_SDL3
+    if (g_audio_stream) {
+      SDL_DestroyAudioStream(g_audio_stream);
+      g_audio_stream = NULL;
+    } else {
+      SDL_CloseAudioDevice(g_audio_device);
+    }
+#else
     SDL_CloseAudioDevice(g_audio_device);
+#endif
     g_audio_device = 0;
   }
   if (g_audio_mutex) {
@@ -1866,10 +1942,11 @@ static void HandleCommand(uint32 j, bool pressed) {
   } else {
     switch (j) {
     case kKeys_Fullscreen:
-      g_win_flags ^= SDL_WINDOW_FULLSCREEN_DESKTOP;
-      SDL_SetWindowFullscreen(g_window, g_win_flags & SDL_WINDOW_FULLSCREEN_DESKTOP);
+      g_win_flags ^= SNESRECOMP_SDL_WINDOW_FULLSCREEN_DESKTOP;
+      snesrecomp_sdl_set_fullscreen(
+          g_window, (g_win_flags & SNESRECOMP_SDL_WINDOW_FULLSCREEN_DESKTOP) != 0);
       g_cursor = !g_cursor;
-      SDL_ShowCursor(g_cursor);
+      snesrecomp_sdl_show_cursor(g_cursor);
       break;
     case kKeys_Reset:
       RtlReset(1);
@@ -1883,7 +1960,7 @@ static void HandleCommand(uint32 j, bool pressed) {
       if (g_paused) {
         SDL_SetRenderDrawBlendMode(g_renderer, SDL_BLENDMODE_BLEND);
         SDL_SetRenderDrawColor(g_renderer, 0, 0, 0, 159);
-        SDL_RenderFillRect(g_renderer, NULL);
+        snesrecomp_sdl_fill_rect(g_renderer);
         SDL_RenderPresent(g_renderer);
       }
 #endif
@@ -1918,7 +1995,7 @@ static uint32 GetActiveControllers() {
 
 static void RefreshKeybindControllerBits(void) {
   /* keybinds bit layout -> kKeys_Controls index. Idempotent set/clear. */
-  const uint8_t *keys = SDL_GetKeyboardState(NULL);
+  const uint8_t *keys = snesrecomp_sdl_get_keyboard_state();
   uint16_t kb_p1 = keybinds_read_player(keys, 1);
   uint16_t kb_p2 = keybinds_read_player(keys, 2);
   static const uint8 kKb2CtrlsIdx[12] = { 7, 6, 5, 4, 9, 8, 3, 11, 2, 10, 1, 0 };
@@ -2010,7 +2087,7 @@ static void MwNetplayPollEvents(void *ctx, int *want_soft_exit) {
             "netplay: ended (sdl_quit) — returning to lobby");
       return;
     }
-    if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_ESCAPE) {
+    if (ev.type == SDL_KEYDOWN && SNESRECOMP_SDL_EVENT_KEY(ev) == SDLK_ESCAPE) {
       *want_soft_exit = 1;
       if (g_netplay_from_lobby)
         host_report_breadcrumb(
@@ -2018,22 +2095,23 @@ static void MwNetplayPollEvents(void *ctx, int *want_soft_exit) {
       return;
     }
     if (ev.type == SDL_CONTROLLERDEVICEADDED)
-      OpenOneGamepad(ev.cdevice.which);
+      OpenOneGamepad(SNESRECOMP_SDL_EVENT_DEVICE(ev));
     else if (ev.type == SDL_CONTROLLERDEVICEREMOVED) {
-      GamepadInfo *gi = GetGamepadInfo(ev.cdevice.which);
+      GamepadInfo *gi = GetGamepadInfo(SNESRECOMP_SDL_EVENT_DEVICE(ev));
       if (gi) {
         memset(gi, 0, sizeof(GamepadInfo));
         gi->joystick_id = -1;
       }
     } else if (ev.type == SDL_CONTROLLERAXISMOTION) {
-      GamepadInfo *gi = GetGamepadInfo(ev.caxis.which);
+      GamepadInfo *gi = GetGamepadInfo(SNESRECOMP_SDL_EVENT_AXIS_DEVICE(ev));
       if (gi)
-        HandleGamepadAxisInput(gi, ev.caxis.axis, ev.caxis.value);
+        HandleGamepadAxisInput(gi, SNESRECOMP_SDL_EVENT_AXIS(ev),
+                               SNESRECOMP_SDL_EVENT_AXIS_VALUE(ev));
     } else if (ev.type == SDL_CONTROLLERBUTTONDOWN ||
                ev.type == SDL_CONTROLLERBUTTONUP) {
-      GamepadInfo *gi = GetGamepadInfo(ev.cbutton.which);
+      GamepadInfo *gi = GetGamepadInfo(SNESRECOMP_SDL_EVENT_BUTTON_DEVICE(ev));
       if (gi) {
-        int b = RemapSdlButton(ev.cbutton.button);
+        int b = RemapSdlButton(SNESRECOMP_SDL_EVENT_BUTTON(ev));
         if (b >= 0)
           HandleGamepadInput(gi, b, ev.type == SDL_CONTROLLERBUTTONDOWN);
       }
@@ -2078,59 +2156,80 @@ static int NetplayBarrierAdmit(bool *running) {
 
 
 static void OpenOneGamepad(int i) {
-  if (SDL_IsGameController(i)) {
-    SDL_GameController *controller = SDL_GameControllerOpen(i);
-    if (!controller) {
-      fprintf(stderr, "Could not open gamepad %d: %s\n", i, SDL_GetError());
-      return;
+#if SNESRECOMP_SDL3
+  SDL_JoystickID id = (SDL_JoystickID)i;
+  if (!SDL_IsGamepad(id))
+    return;
+  SDL_Gamepad *controller = SDL_OpenGamepad(id);
+  if (!controller) {
+    fprintf(stderr, "Could not open gamepad %d: %s\n", i, SDL_GetError());
+    return;
+  }
+  uint32 joystick_id = (uint32)id;
+  if (GetGamepadInfo(joystick_id)) {
+    SDL_CloseGamepad(controller);
+    return;
+  }
+  char guid[40] = {0};
+  SDL_GUIDToString(SDL_GetGamepadGUIDForID(id), guid, sizeof(guid));
+#else
+  if (!SDL_IsGameController(i))
+    return;
+  SDL_GameController *controller = SDL_GameControllerOpen(i);
+  if (!controller) {
+    fprintf(stderr, "Could not open gamepad %d: %s\n", i, SDL_GetError());
+    return;
+  }
+
+  uint32 joystick_id = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(controller));
+  if (GetGamepadInfo(joystick_id)) {
+    SDL_GameControllerClose(controller);
+    return;
+  }
+
+  char guid[40] = {0};
+  SDL_JoystickGUID g = SDL_JoystickGetGUID(SDL_GameControllerGetJoystick(controller));
+  SDL_JoystickGetGUIDString(g, guid, sizeof(guid));
+#endif
+
+  int found_idx = -1;
+  /* Prefer the launcher-saved GUID for each player slot. */
+  for (int j = 0; j < 2; j++) {
+    if (!g_config.enable_gamepad[j] || g_gamepad[j].joystick_id != -1)
+      continue;
+    if (g_config.input_device[j][0] &&
+        !StringEqualsNoCase(g_config.input_device[j], "none") &&
+        !StringEqualsNoCase(g_config.input_device[j], "keyboard") &&
+        StringEqualsNoCase(g_config.input_device[j], guid)) {
+      found_idx = j;
+      break;
     }
-
-    uint32 joystick_id = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(controller));
-    if (GetGamepadInfo(joystick_id))
-      return;
-
-    char guid[40] = {0};
-    SDL_JoystickGUID g = SDL_JoystickGetGUID(SDL_GameControllerGetJoystick(controller));
-    SDL_JoystickGetGUIDString(g, guid, sizeof(guid));
-
-    int found_idx = -1;
-    /* Prefer the launcher-saved GUID for each player slot. */
-    for (int j = 0; j < 2; j++) {
-      if (!g_config.enable_gamepad[j] || g_gamepad[j].joystick_id != -1)
-        continue;
-      if (g_config.input_device[j][0] &&
-          !StringEqualsNoCase(g_config.input_device[j], "none") &&
-          !StringEqualsNoCase(g_config.input_device[j], "keyboard") &&
-          StringEqualsNoCase(g_config.input_device[j], guid)) {
+  }
+  if (found_idx < 0) {
+    uint8 scan_order[3] = { (uint8)SDL_GameControllerGetPlayerIndex(controller), 0, 1 };
+    for (int k = 0; k < 3; k++) {
+      uint8 j = scan_order[k];
+      if (j < 2 && g_config.enable_gamepad[j] &&
+          (k == 0 || g_gamepad[j].joystick_id == -1)) {
+        /* Skip slots that already have a different saved GUID waiting. */
+        if (g_config.input_device[j][0] &&
+            !StringEqualsNoCase(g_config.input_device[j], "none") &&
+            !StringEqualsNoCase(g_config.input_device[j], "keyboard") &&
+            !StringEqualsNoCase(g_config.input_device[j], guid))
+          continue;
         found_idx = j;
         break;
       }
     }
-    if (found_idx < 0) {
-      uint8 scan_order[3] = { SDL_GameControllerGetPlayerIndex(controller), 0, 1 };
-      for (int k = 0; k < 3; k++) {
-        uint8 j = scan_order[k];
-        if (j < 2 && g_config.enable_gamepad[j] &&
-            (k == 0 || g_gamepad[j].joystick_id == -1)) {
-          /* Skip slots that already have a different saved GUID waiting. */
-          if (g_config.input_device[j][0] &&
-              !StringEqualsNoCase(g_config.input_device[j], "none") &&
-              !StringEqualsNoCase(g_config.input_device[j], "keyboard") &&
-              !StringEqualsNoCase(g_config.input_device[j], guid))
-            continue;
-          found_idx = j;
-          break;
-        }
-      }
-    }
+  }
 
-    printf("Found controller '%s' assigning to player %d\n", SDL_GameControllerName(controller), found_idx + 1);
-    if (found_idx >= 0) {
-      GamepadInfo *gi = &g_gamepad[found_idx];
-      memset(gi, 0, sizeof(GamepadInfo));
-      gi->index = found_idx;
-      gi->joystick_id = joystick_id;
-    }
+  printf("Found controller '%s' assigning to player %d\n",
+         SDL_GameControllerName(controller), found_idx + 1);
+  if (found_idx >= 0) {
+    GamepadInfo *gi = &g_gamepad[found_idx];
+    memset(gi, 0, sizeof(GamepadInfo));
+    gi->index = found_idx;
+    gi->joystick_id = joystick_id;
   }
 }
 
@@ -2193,7 +2292,7 @@ static void HandleVolumeAdjustment(int volume_adjustment) {
   SetApplicationVolume(new_volume);
   printf("[System Volume]=%i\n", new_volume);
 #else
-  g_sdl_audio_mixer_volume = IntMin(IntMax(0, g_sdl_audio_mixer_volume + volume_adjustment * (SDL_MIX_MAXVOLUME >> 4)), SDL_MIX_MAXVOLUME);
+  g_sdl_audio_mixer_volume = IntMin(IntMax(0, g_sdl_audio_mixer_volume + volume_adjustment * (SNESRECOMP_SDL_MIX_MAXVOLUME >> 4)), SNESRECOMP_SDL_MIX_MAXVOLUME);
   printf("[SDL mixer volume]=%i\n", g_sdl_audio_mixer_volume);
 #endif
 }

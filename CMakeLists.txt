@@ -23,11 +23,8 @@ message(STATUS "Metal Warriors lobby game_version: ${SNESRECOMP_BUILD_VERSION} (
 # Prerequisites: snesrecomp + recomp-ui git submodules at the repo root
 # (`git submodule update --init --recursive`), the generated C in src/gen/
 # (run `bash tools/regen.sh` with a verified metalwarriors.sfc at the repo
-# root), and SDL2 (e.g. `apt install libsdl2-dev`).
-#
-# snesrecomp defaults to SDL3 for new hosts, but this game's src/main.c /
-# opengl.c are still SDL2-shaped. Stay on the explicit SDL2 fallback until
-# that port lands (recomp-ui follows SNESRECOMP_SDL_BACKEND).
+# root), and SDL3 (e.g. `apt install libsdl3-dev`). SDL2 remains available
+# via `-DSNESRECOMP_SDL_BACKEND=SDL2`.
 
 set(CMAKE_C_STANDARD 11)
 
@@ -35,8 +32,6 @@ set(SNESRECOMP_ROOT "${CMAKE_SOURCE_DIR}/snesrecomp" CACHE PATH
     "Path to the snesrecomp checkout used by this game")
 option(SNESRECOMP_NET_ICE
     "Enable ICE/libjuice for Metal Warriors internet netplay" OFF)
-set(SNESRECOMP_SDL_BACKEND "SDL2" CACHE STRING
-    "Desktop SDL backend (SDL3 or SDL2)")
 include(${SNESRECOMP_ROOT}/runner/runner.cmake)
 
 find_package(OpenGL REQUIRED)
@@ -104,7 +99,7 @@ if(NOT MSVC)
         $<$<COMPILE_LANGUAGE:C>:-Wno-implicit-function-declaration>)
 endif()
 
-# SDL2/SDL3 discovery + link (and recomp-ui LNG_SDL3) via runner helper.
+# SDL3 (default) / SDL2 discovery + link; recomp-ui follows SNESRECOMP_SDL_BACKEND.
 snesrecomp_target_sdl(MetalWarriorsSNESRecomp)
 
 target_link_libraries(MetalWarriorsSNESRecomp PRIVATE

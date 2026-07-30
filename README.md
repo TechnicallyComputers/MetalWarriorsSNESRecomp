@@ -53,7 +53,7 @@ cmake -S . -B build -DSNESRECOMP_ROOT="$env:SNESRECOMP_ROOT"
 cmake --build build --parallel
 ```
 
-The ROM must be staged before running `tools/regen.sh`. SDL2 and OpenGL
+The ROM must be staged before running `tools/regen.sh`. SDL3 and OpenGL
 development libraries are also required. For the standard Linux build wrapper,
 `bash tools/build-linux.sh --config debug` configures and builds the game after
 generation.

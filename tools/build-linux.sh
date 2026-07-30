@@ -25,7 +25,7 @@
 #   bash tools/build-linux.sh --out DIR       # where to drop the .AppImage
 #   bash tools/build-linux.sh --jobs N        # parallel build jobs (default: nproc)
 #
-# Prereqs: cmake, a C/C++ toolchain, libsdl2-dev, libgl1-mesa-dev, and the
+# Prereqs: cmake, a C/C++ toolchain, libsdl3-dev, libgl1-mesa-dev, and the
 # AppImage tools at ~/recomp-tools/{linuxdeploy,appimagetool}. Regen needs a
 # verified ROM at the repo root (see tools/regen.sh).
 set -euo pipefail
@@ -70,13 +70,13 @@ done
 case "$CONFIG" in prod) FLAGS=( "${PROD_CMAKE_FLAGS[@]}" );; debug) FLAGS=( "${DEBUG_CMAKE_FLAGS[@]}" );;
   *) echo "--config must be prod or debug (got '$CONFIG')" >&2; exit 2;; esac
 
-# Point cmake at the HOST's Linux SDL2. Several game CMakeLists pin a bundled
-# (Windows) SDL2 dev pack on CMAKE_PREFIX_PATH for the MSVC build; -DSDL2_DIR is
+# Point cmake at the HOST's Linux SDL3. Several game CMakeLists pin a bundled
+# (Windows) SDL3 dev pack on CMAKE_PREFIX_PATH for the MSVC build; -DSDL3_DIR is
 # the explicit CONFIG-mode hint and is consulted before CMAKE_PREFIX_PATH, so the
 # real Linux .so links instead of a Windows import lib. Harmless when the game
-# already finds system SDL2.
-SDL2_CFG_DIR="$( { find /usr/lib /usr/lib64 /usr/local/lib -type d -path '*cmake/SDL2' 2>/dev/null || true; } | head -1 )"
-[ -n "$SDL2_CFG_DIR" ] && FLAGS+=( -DSDL2_DIR="$SDL2_CFG_DIR" )
+# already finds system SDL3.
+SDL3_CFG_DIR="$( { find /usr/lib /usr/lib64 /usr/local/lib -type d -path '*cmake/SDL3' 2>/dev/null || true; } | head -1 )"
+[ -n "$SDL3_CFG_DIR" ] && FLAGS+=( -DSDL3_DIR="$SDL3_CFG_DIR" )
 
 # Single cleanup hook: remove the AppDir scratch dir AND restore any .pin files
 # the --nopin bypass moved aside (so a failed build never leaves the repo dirty).
