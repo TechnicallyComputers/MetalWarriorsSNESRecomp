@@ -68,6 +68,19 @@ direct offline boot:
 ./build/MetalWarriorsSNESRecomp --no-launcher metalwarriors.sfc
 ```
 
+### Local generate setup wizard
+
+When the game is launched from a source checkout that still has
+`snesrecomp/snesrecomp_cli.py` (and Python on `PATH`), recomp-ui’s first-run
+setup modal can **Generate sources…** from your verified ROM. That drives the
+same headless SDK as `tools/regen.sh` (`snesrecomp generate` with JSON
+progress). After generate completes, rebuild the binary so PLAY uses the new C.
+
+The wizard opens automatically when `src/gen/dispatch_v2.c` is missing, or when
+`METALWARRIORS_FORCE_SETUP=1` is set (useful for testing the flow even if
+`src/gen` already exists). Override the project root with
+`METALWARRIORS_PROJECT_ROOT` if you launch from another working directory.
+
 The trace-enabled debug TCP server listens on port **4380**.
 
 ## LAN netplay

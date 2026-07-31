@@ -48,6 +48,7 @@
 #include "recomp_launcher.h"
 #include "launcher_profile.h"
 #include "snes_lobby_client.h"
+#include "codegen_setup.h"
 #endif
 #include "snes_netplay.h"
 #include "snes_host_session.h"
@@ -1028,6 +1029,7 @@ int main(int argc, char** argv) {
         gi.netplay_supported = 1;
         MwHostLobbyEnsureInit();
     gi.netplay = snes_host_lobby_callbacks();
+        mw_codegen_setup_apply(&gi);
 
         char initial_rom[512] = "";
         if (has_positional_rom)
@@ -1799,6 +1801,7 @@ error_reading:;
     gi.netplay_supported = 1;
     MwHostLobbyEnsureInit();
     gi.netplay = snes_host_lobby_callbacks();
+    mw_codegen_setup_apply(&gi);
 
     char resume_rom[512];
     snprintf(resume_rom, sizeof(resume_rom), "%s", rom_path_buf);

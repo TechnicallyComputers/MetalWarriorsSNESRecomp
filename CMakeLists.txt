@@ -48,6 +48,7 @@ add_executable(MetalWarriorsSNESRecomp
     ${SNESRECOMP_RUNNER_SOURCES}
     # game-specific runtime
     src/config.c
+    src/codegen_setup.c
     src/glsl_shader.c
     src/main.c
     src/post_mortem.c
