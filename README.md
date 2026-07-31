@@ -70,24 +70,19 @@ direct offline boot:
 
 ### Local generate setup wizard
 
-When the game is launched from a source checkout that still has
-`snesrecomp/snesrecomp_cli.py` (and Python on `PATH`), recomp-ui’s first-run
-setup modal can **Generate & rebuild…** from your verified ROM. That drives the
-same headless SDK as `tools/regen.sh`, then rebuilds and relaunches.
+When launched from a source checkout with `snesrecomp` + Python, recomp-ui’s
+first-run modal offers **Generate & rebuild…**. MW only supplies a small config
+(`src/codegen_setup.c`); the portable host lives in
+`snesrecomp/host/snesrecomp_codegen_host.*` (see
+`snesrecomp/docs/LOCAL_CODEGEN_SDK.md`).
 
-- **Linux / macOS:** runs `cmake --build` in-process, then `exec`s the new binary.
-- **Windows:** writes `build/mw_deferred_rebuild.cmd`, exits, and that helper
-  waits for the game process to end before building (avoids a locked `.exe`),
-  then starts the new binary. Same `build/` layout as other platforms.
+- **Linux / macOS:** in-process `cmake --build`, then `exec` the new binary.
+- **Windows:** `build/recomp_deferred_rebuild.cmd` waits for exit, builds, relaunches.
 
-Requires `cmake` on `PATH` and a configured `build/` tree (override with
-`METALWARRIORS_BUILD_DIR`). If CMake/build is missing, the wizard falls back to
-generate-only. **Continue to launcher** stays disabled until generate
-succeeds (and rebuild is scheduled/finished when available).
-
-The wizard opens automatically when `src/gen/dispatch_v2.c` is missing, or when
-`METALWARRIORS_FORCE_SETUP=1` is set. Override the project root with
-`METALWARRIORS_PROJECT_ROOT` if you launch from another working directory.
+Requires `cmake` on `PATH` and a configured `build/` tree
+(`METALWARRIORS_BUILD_DIR` / `SNESRECOMP_BUILD_DIR`). **Continue** stays
+disabled until generate succeeds. Auto-opens when `src/gen` is missing or
+`METALWARRIORS_FORCE_SETUP=1`.
 
 The trace-enabled debug TCP server listens on port **4380**.
 

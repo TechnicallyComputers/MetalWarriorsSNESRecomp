@@ -57,6 +57,8 @@ add_executable(MetalWarriorsSNESRecomp
     src/mw_cpu_infra.c
     src/mw_rtl.c
     src/mw_spc_player.c
+    # portable snesrecomp generate/rebuild/relaunch host (recomp-ui setup)
+    ${SNESRECOMP_ROOT}/host/snesrecomp_codegen_host.c
 
     # OpenGL function loader
     third_party/gl_core/gl_core_3_1.c
@@ -67,10 +69,13 @@ add_executable(MetalWarriorsSNESRecomp
 # Do not add ${CMAKE_SOURCE_DIR} itself: on case-insensitive macOS volumes the
 # VERSION pin file shadows the C++ standard <version> header and breaks ImGui.
 # third_party/ is enough for "gl_core/..." and "stb/..." includes.
+# recomp-ui/src supplies recomp_launcher.h for the portable codegen host.
 target_include_directories(MetalWarriorsSNESRecomp PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/recomp
     ${CMAKE_SOURCE_DIR}/third_party
+    ${CMAKE_SOURCE_DIR}/recomp-ui/src
+    ${SNESRECOMP_ROOT}/host
     ${SNESRECOMP_RUNNER_INCLUDE_DIRS}
 )
 
