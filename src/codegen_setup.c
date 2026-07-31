@@ -29,7 +29,9 @@ static char g_python[512];
 static char g_cmake[512];
 static char g_build_dir[1100];
 static char g_exe_path[1100];
+static char g_helper_path[1100]; /* Windows deferred rebuild .cmd */
 static int g_ready = 0;
+static int g_relaunch_is_helper = 0;
 
 static int path_is_file(const char* path) {
 #if defined(_WIN32)
@@ -459,81 +461,66 @@ static int mw_prepare_generate(const char* source_path, char* out_path,
 }
 
 #if defined(_WIN32)
-static int run_cmake_build_win(RecompLauncherCPrepareProgressFn on_progress,
-                               void* progress_ctx, char* err_msg,
-                               size_t err_cap) {
-    char cmdline[2048];
-    snprintf(cmdline, sizeof(cmdline),
-             "\"%s\" --build \"%s\" --parallel --target MetalWarriorsSNESRecomp",
-             g_cmake, g_build_dir);
+/* Write set "NAME=value" with % doubled for cmd.exe. */
+static void bat_write_set(FILE* f, const char* name, const char* value) {
+    fprintf(f, "set \"%s=", name);
+    for (const char* p = value; *p; ++p) {
+        if (*p == '%')
+            fputc('%', f);
+        fputc(*p, f);
+    }
+    fprintf(f, "\"\r\n");
+}
 
-    SECURITY_ATTRIBUTES sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.nLength = sizeof(sa);
-    sa.bInheritHandle = TRUE;
-    HANDLE rd = NULL, wr = NULL;
-    if (!CreatePipe(&rd, &wr, &sa, 0)) {
-        snprintf(err_msg, err_cap, "CreatePipe failed.");
+/* Option 2: quit first, then an external helper builds and relaunches so the
+ * running .exe is never overwritten while locked. */
+static int write_windows_deferred_rebuild_helper(char* err_msg, size_t err_cap) {
+    if (!join_path(g_helper_path, sizeof(g_helper_path), g_build_dir,
+                   "mw_deferred_rebuild.cmd")) {
+        snprintf(err_msg, err_cap, "Failed to form helper path.");
         return 0;
     }
-    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
-
-    STARTUPINFOA si;
-    PROCESS_INFORMATION pi;
-    memset(&si, 0, sizeof(si));
-    memset(&pi, 0, sizeof(pi));
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdOutput = wr;
-    si.hStdError = wr;
-    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-
-    char mutable_cmd[2048];
-    snprintf(mutable_cmd, sizeof(mutable_cmd), "%s", cmdline);
-    if (!CreateProcessA(NULL, mutable_cmd, NULL, NULL, TRUE, 0, NULL,
-                        g_project_root, &si, &pi)) {
-        CloseHandle(rd);
-        CloseHandle(wr);
-        snprintf(err_msg, err_cap, "Failed to spawn cmake --build.");
+    FILE* f = fopen(g_helper_path, "wb");
+    if (!f) {
+        snprintf(err_msg, err_cap, "Failed to write rebuild helper: %s",
+                 g_helper_path);
         return 0;
     }
-    CloseHandle(wr);
-
-    char buf[512];
-    char line[1024];
-    size_t line_len = 0;
-    DWORD n = 0;
-    int line_i = 0;
-    while (ReadFile(rd, buf, sizeof(buf), &n, NULL) && n > 0) {
-        for (DWORD i = 0; i < n; ++i) {
-            char c = buf[i];
-            if (c == '\r') continue;
-            if (c == '\n') {
-                line[line_len] = '\0';
-                if (line[0] && on_progress) {
-                    float pct = 0.15f + (float)((line_i++ % 80) / 100.0);
-                    if (pct > 0.95f) pct = 0.95f;
-                    on_progress(progress_ctx, pct, line);
-                }
-                line_len = 0;
-                continue;
-            }
-            if (line_len + 1 < sizeof(line))
-                line[line_len++] = c;
-        }
-    }
-    CloseHandle(rd);
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    DWORD code = 1;
-    GetExitCodeProcess(pi.hProcess, &code);
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-    if (code == 0) return 1;
-    snprintf(err_msg, err_cap,
-             "cmake --build failed (exit %lu). If the game is locked, quit "
-             "and rebuild from a terminal.",
-             (unsigned long)code);
-    return 0;
+    char pid_buf[32];
+    snprintf(pid_buf, sizeof(pid_buf), "%lu",
+             (unsigned long)GetCurrentProcessId());
+    fprintf(f, "@echo off\r\n");
+    fprintf(f, "setlocal EnableExtensions\r\n");
+    fprintf(f, "title Metal Warriors - rebuilding\r\n");
+    bat_write_set(f, "PARENT_PID", pid_buf);
+    bat_write_set(f, "CMAKE", g_cmake);
+    bat_write_set(f, "BUILD_DIR", g_build_dir);
+    bat_write_set(f, "EXE", g_exe_path);
+    bat_write_set(f, "ROOT", g_project_root);
+    fprintf(f,
+            "echo Waiting for Metal Warriors to exit...\r\n"
+            ":waitloop\r\n"
+            "tasklist /FI \"PID eq %%PARENT_PID%%\" 2>NUL | "
+            "findstr /I \"%%PARENT_PID%%\" >NUL\r\n"
+            "if not errorlevel 1 (\r\n"
+            "  ping -n 2 127.0.0.1 >NUL\r\n"
+            "  goto waitloop\r\n"
+            ")\r\n"
+            "echo Building...\r\n"
+            "cd /d \"%%ROOT%%\"\r\n"
+            "\"%%CMAKE%%\" --build \"%%BUILD_DIR%%\" --parallel "
+            "--target MetalWarriorsSNESRecomp\r\n"
+            "if errorlevel 1 (\r\n"
+            "  echo.\r\n"
+            "  echo Build failed. Fix the errors above, then rebuild manually.\r\n"
+            "  pause\r\n"
+            "  exit /b 1\r\n"
+            ")\r\n"
+            "echo Starting Metal Warriors...\r\n"
+            "start \"\" /D \"%%ROOT%%\" \"%%EXE%%\" --launcher\r\n"
+            "endlocal\r\n");
+    fclose(f);
+    return 1;
 }
 #else
 static int run_cmake_build_posix(RecompLauncherCPrepareProgressFn on_progress,
@@ -609,21 +596,31 @@ static int mw_rebuild_game(const char* rom_path, char* out_exe_path,
                            RecompLauncherCPrepareProgressFn on_progress,
                            void* progress_ctx) {
     (void)rom_path;
+    g_relaunch_is_helper = 0;
     if (!g_ready || !g_cmake[0] || !g_build_dir[0]) {
         snprintf(err_msg, err_cap, "CMake build environment is not available.");
         return 0;
     }
-    if (on_progress)
-        on_progress(progress_ctx, 0.05f, "Starting cmake --build…");
 
 #if defined(_WIN32)
-    if (!run_cmake_build_win(on_progress, progress_ctx, err_msg, err_cap))
+    /* Do not link while this process holds the .exe lock. Schedule a helper
+     * that waits for exit, builds, then starts the new binary. */
+    if (on_progress)
+        on_progress(progress_ctx, 0.4f,
+                    "Scheduling Windows rebuild after exit…");
+    if (!write_windows_deferred_rebuild_helper(err_msg, err_cap))
         return 0;
+    g_relaunch_is_helper = 1;
+    snprintf(out_exe_path, out_cap, "%s", g_helper_path);
+    if (on_progress)
+        on_progress(progress_ctx, 1.0f,
+                    "Exiting so Windows can rebuild safely…");
+    return 1;
 #else
+    if (on_progress)
+        on_progress(progress_ctx, 0.05f, "Starting cmake --build…");
     if (!run_cmake_build_posix(on_progress, progress_ctx, err_msg, err_cap))
         return 0;
-#endif
-
     if (!path_is_file(g_exe_path)) {
         snprintf(err_msg, err_cap, "Build succeeded but binary missing: %s",
                  g_exe_path);
@@ -633,6 +630,7 @@ static int mw_rebuild_game(const char* rom_path, char* out_exe_path,
     if (on_progress)
         on_progress(progress_ctx, 1.0f, "Build complete");
     return 1;
+#endif
 }
 
 void mw_codegen_relaunch_or_exit(const char* rom_path) {
@@ -648,19 +646,27 @@ void mw_codegen_relaunch_or_exit(const char* rom_path) {
             fclose(rc);
         }
     }
-    fprintf(stderr, "metalwarriors: relaunching %s\n", exe);
 
 #if defined(_WIN32)
     {
         STARTUPINFOA si;
         PROCESS_INFORMATION pi;
         char cmd[1536];
+        DWORD flags = 0;
         memset(&si, 0, sizeof(si));
         memset(&pi, 0, sizeof(pi));
         si.cb = sizeof(si);
-        snprintf(cmd, sizeof(cmd), "\"%s\" --launcher", exe);
-        if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, 0, NULL, g_project_root,
-                            &si, &pi)) {
+        if (g_relaunch_is_helper) {
+            /* New console helper: wait for this PID → cmake --build → start. */
+            fprintf(stderr, "metalwarriors: starting deferred rebuild helper\n");
+            snprintf(cmd, sizeof(cmd), "cmd.exe /C \"%s\"", exe);
+            flags = CREATE_NEW_CONSOLE;
+        } else {
+            fprintf(stderr, "metalwarriors: relaunching %s\n", exe);
+            snprintf(cmd, sizeof(cmd), "\"%s\" --launcher", exe);
+        }
+        if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, flags, NULL,
+                            g_project_root, &si, &pi)) {
             fprintf(stderr, "metalwarriors: CreateProcess relaunch failed\n");
             exit(1);
         }
@@ -670,6 +676,7 @@ void mw_codegen_relaunch_or_exit(const char* rom_path) {
     }
 #else
     {
+        fprintf(stderr, "metalwarriors: relaunching %s\n", exe);
         char* args[] = { exe, "--launcher", NULL };
         execv(exe, args);
         perror("metalwarriors: execv relaunch failed");
@@ -699,6 +706,8 @@ void mw_codegen_setup_apply(RecompLauncherCGameInfo* gi) {
         return;
 
     g_ready = 1;
+    g_relaunch_is_helper = 0;
+    g_helper_path[0] = '\0';
     gi->prepare_with_progress = mw_prepare_generate;
     gi->prepare_use_selected_rom = 1;
     gi->prepare_section_title = "2. Generate C sources & rebuild";
@@ -709,15 +718,26 @@ void mw_codegen_setup_apply(RecompLauncherCGameInfo* gi) {
                             resolve_build_paths();
     if (can_rebuild) {
         gi->prepare_disc_label = "Generate & rebuild…";
+#if defined(_WIN32)
+        gi->prepare_disc_note =
+            "Uses your verified Metal Warriors (USA) ROM with the local "
+            "snesrecomp SDK to regenerate src/gen, then quits and rebuilds via "
+            "a helper so the running .exe is not locked. You must legally own "
+            "this ROM.";
+        gi->rebuild_busy_status = "Scheduling rebuild…";
+        gi->rebuild_success_status =
+            "Exiting for Windows rebuild — a console will finish the build…";
+#else
         gi->prepare_disc_note =
             "Uses your verified Metal Warriors (USA) ROM with the local "
             "snesrecomp SDK to regenerate src/gen, then runs cmake --build and "
             "restarts into the new binary. You must legally own this ROM.";
+        gi->rebuild_busy_status = "Building game…";
+        gi->rebuild_success_status = "Build complete — restarting…";
+#endif
         gi->rebuild_with_progress = mw_rebuild_game;
         gi->rebuild_after_prepare = 1;
         gi->relaunch_after_rebuild = 1;
-        gi->rebuild_busy_status = "Building game…";
-        gi->rebuild_success_status = "Build complete — restarting…";
     } else {
         gi->prepare_disc_label = "Generate sources…";
         gi->prepare_disc_note =
@@ -730,6 +750,8 @@ void mw_codegen_setup_apply(RecompLauncherCGameInfo* gi) {
 
     const char* force = getenv("METALWARRIORS_FORCE_SETUP");
     if (mw_codegen_sources_missing() ||
-        (force && force[0] && force[0] != '0'))
+        (force && force[0] && force[0] != '0')) {
         gi->needs_setup = 1;
+        gi->prepare_required_before_continue = 1;
+    }
 }
