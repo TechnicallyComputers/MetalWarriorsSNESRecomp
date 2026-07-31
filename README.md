@@ -72,9 +72,13 @@ direct offline boot:
 
 When the game is launched from a source checkout that still has
 `snesrecomp/snesrecomp_cli.py` (and Python on `PATH`), recomp-ui’s first-run
-setup modal can **Generate sources…** from your verified ROM. That drives the
-same headless SDK as `tools/regen.sh` (`snesrecomp generate` with JSON
-progress). After generate completes, rebuild the binary so PLAY uses the new C.
+setup modal can **Generate & rebuild…** from your verified ROM. That drives the
+same headless SDK as `tools/regen.sh`, then runs `cmake --build` on the
+existing `build/` directory and relaunches the new binary automatically.
+
+Requires `cmake` on `PATH` and a configured `build/` tree (override with
+`METALWARRIORS_BUILD_DIR`). If CMake/build is missing, the wizard falls back to
+generate-only and asks you to rebuild manually.
 
 The wizard opens automatically when `src/gen/dispatch_v2.c` is missing, or when
 `METALWARRIORS_FORCE_SETUP=1` is set (useful for testing the flow even if

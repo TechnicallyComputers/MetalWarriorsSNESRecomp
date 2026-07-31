@@ -17,6 +17,10 @@ void mw_codegen_setup_apply(RecompLauncherCGameInfo* gi);
 /* True when project_root/src/gen/dispatch_v2.c is missing. */
 int mw_codegen_sources_missing(void);
 
+/* After recomp_launcher_run_window returns RELAUNCH: persist rom.cfg and
+ * exec the rebuilt binary. Does not return on success. */
+void mw_codegen_relaunch_or_exit(const char* rom_path);
+
 #ifdef __cplusplus
 }
 #endif

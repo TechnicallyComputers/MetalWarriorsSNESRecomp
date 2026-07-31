@@ -1052,7 +1052,12 @@ int main(int argc, char** argv) {
             initial_rom[0] ? initial_rom : NULL,
             rom_path_buf, sizeof(rom_path_buf));
         RecompLauncherCNetplayLaunch net = ls.netplay_launch;
-        if (lr == 1) {
+        if (lr == RECOMP_LAUNCHER_RESULT_RELAUNCH) {
+          host_report_breadcrumb("launcher: relaunch after generate/rebuild");
+          snes_host_lobby_leave();
+          mw_codegen_relaunch_or_exit(rom_path_buf);
+        }
+        if (lr == RECOMP_LAUNCHER_RESULT_QUIT) {
           /* Setup wizard persists rom.cfg; also write on quit so a path
            * chosen this session is kept if the user never hit PLAY. */
           if (rom_path_buf[0]) {
@@ -1066,7 +1071,7 @@ int main(int argc, char** argv) {
           host_report_breadcrumb("launcher: quit");
           return 0;
         }
-        if (lr == 0 && rom_path_buf[0]) {
+        if (lr == RECOMP_LAUNCHER_RESULT_LAUNCH && rom_path_buf[0]) {
           ConfigFromLauncherSettings(&ls);
           /* Netplay: lock WS 71. Offline: hard-off for native split H2H. */
           g_config.widescreen = net.enabled ? 71 : 0;
