@@ -1,0 +1,804 @@
+# Metal Warriors (USA) — progressive symbol map (partial decomp)
+#
+# Source of truth for function / site / WRAM / struct labels.
+# Run:  python3 tools/sync_symbols.py
+# Then: bash tools/regen.sh --no-tests   (regen.sh calls sync first)
+#
+# [[func]]     — routine entry. emit=true → bankXX.cfg `func` line → named AOT C.
+# [[site]]     — mid-function opcode / hook PC (never emitted as a func).
+# [[site_group]] — named list of site PCs (arrays in mw_symbols.h).
+# [[object]]   — WRAM / globals.
+# [[struct]] / [[field]] — guest layouts (documented + C typedefs in header).
+#
+# status: guessed | confirmed | hot
+# Prefer naming function ENTRIES, not every CMP/BMI site. Sites stay as sites.
+
+# ---------------------------------------------------------------------------
+# Bank $00 — vectors (emit so funcs.h stays in sync with auto_vectors)
+# ---------------------------------------------------------------------------
+
+[[func]]
+bank = 0x00
+pc = 0x80AE
+name = "I_RESET"
+emit = true
+status = "confirmed"
+note = "Emulation RESET vector ($FFFC)"
+
+[[func]]
+bank = 0x00
+pc = 0x8182
+name = "I_NMI"
+emit = true
+status = "confirmed"
+note = "Native NMI trampoline — PHK/PER/JML [$0000]/RTI"
+
+[[func]]
+bank = 0x00
+pc = 0x8224
+name = "I_IRQ"
+emit = true
+status = "confirmed"
+note = "Native IRQ vector ($FFEE)"
+
+# ---------------------------------------------------------------------------
+# Bank $80 — routines already touched by mw_rtl / H2H / widescreen
+# emit=false until AOT ownership is validated (LLE still runs these).
+# ---------------------------------------------------------------------------
+
+[[func]]
+bank = 0x80
+pc = 0x818A
+name = "MwNmiBody"
+emit = false
+status = "confirmed"
+note = "Default NMI hook target in [$0000]; healed when WRAM smash detected"
+
+[[func]]
+bank = 0x80
+pc = 0x86B6
+name = "MwObjectDrawer"
+emit = false
+status = "confirmed"
+note = "Present-path object drawer (interp_bridge_run from host). Emits into OamStaging; H2H host captures sticky for whitelist metas."
+
+[[func]]
+bank = 0x80
+pc = 0x8704
+name = "MwDrawObject_1P"
+emit = false
+status = "hot"
+note = "1P drawer region — STA $86 / meta hooks at $8704/$8714/$8721"
+
+[[func]]
+bank = 0x80
+pc = 0x87A0
+name = "MwDrawObject_H2H"
+emit = false
+status = "hot"
+note = "H2H dual drawer (cam0 then cam1). Sites $87DE/$8802/$881F/$882F. OAM pressure often keeps 1 of N tiles — host multi-tile sticky."
+
+[[func]]
+bank = 0x80
+pc = 0x9219
+name = "MwActiveListBuilder"
+emit = false
+status = "guessed"
+note = "Active-list / prop Y-gate / screen-X CMP cluster (~$922E..)"
+
+[[func]]
+bank = 0x80
+pc = 0x92E4
+name = "MwBgDmaSetup"
+emit = false
+status = "guessed"
+note = "BG1/BG2 DMA size sites $92E4/$9328 (widescreen widen). Feeds StripSrc_A/B + VRAM; coldump strip.* samples post-present."
+
+[[func]]
+bank = 0x80
+pc = 0x943B
+name = "MwStageDirtyRect"
+emit = false
+status = "hot"
+note = "Stage dirty-rect lo/hi builders → $1E72..$1E78 (map column dirty for $7F→VRAM)"
+
+[[func]]
+bank = 0x80
+pc = 0xA5AB
+name = "MwObjOnscreenTest"
+emit = false
+status = "confirmed"
+note = "Object onscreen entry / BMI / CMP; objgfx caller $A5D7"
+
+[[func]]
+bank = 0x80
+pc = 0xA838
+name = "MwBgDmaSetupAlt"
+emit = false
+status = "guessed"
+note = "Alt DMA size sites $A838/$A87F"
+
+[[func]]
+bank = 0x80
+pc = 0xB99B
+name = "MwH2hYBias"
+emit = false
+status = "hot"
+note = "H2H taller OAM Y bias sites $B99B/$B9EF"
+
+[[func]]
+bank = 0x80
+pc = 0xDC13
+name = "MwParticleWindow"
+emit = false
+status = "hot"
+note = "Particle BMI/BCS/after-STA window cluster"
+
+# ---------------------------------------------------------------------------
+# Bank $82 — spawn / bbox helpers
+# ---------------------------------------------------------------------------
+
+[[func]]
+bank = 0x82
+pc = 0x837E
+name = "MwBBoxWindow"
+emit = false
+status = "hot"
+note = "BBox left BCC / right BCS — cam0/cam1 pairs"
+
+[[func]]
+bank = 0x82
+pc = 0x83B2
+name = "MwDistLimitSta"
+emit = false
+status = "confirmed"
+note = "Widen $8283AC radius STA for update/despawn callers"
+
+[[func]]
+bank = 0x82
+pc = 0xF62A
+name = "MwSpawnWindow"
+emit = false
+status = "hot"
+note = "Spawn Y height / left STA / hi CMP cluster $F62A..$F733"
+
+# ---------------------------------------------------------------------------
+# Bank $84 — object gate / Y bias
+# ---------------------------------------------------------------------------
+
+[[func]]
+bank = 0x84
+pc = 0x834C
+name = "MwH2hYBias_Bank84"
+emit = false
+status = "hot"
+note = "H2H taller Y bias (bank $84)"
+
+[[func]]
+bank = 0x84
+pc = 0x83C6
+name = "MwObjGateHeartbeat"
+emit = false
+status = "confirmed"
+note = "Object gate heartbeat hook"
+
+# ---------------------------------------------------------------------------
+# Hook sites (scalar) — used by mw_rtl opcode hooks
+# ---------------------------------------------------------------------------
+
+[[site]]
+addr = 0x8092E4
+name = "DmaSizeBg1"
+status = "confirmed"
+note = "BG1 DASIZ / STA $4305"
+
+[[site]]
+addr = 0x809328
+name = "DmaSizeBg2"
+status = "confirmed"
+note = "BG2 DASIZ / STA $4305"
+
+[[site]]
+addr = 0x80A838
+name = "DmaSizeAlt1"
+status = "confirmed"
+note = "Alt DMA size site"
+
+[[site]]
+addr = 0x80A87F
+name = "DmaSizeAlt2"
+status = "confirmed"
+note = "Alt DMA size site"
+
+[[site]]
+addr = 0x80943B
+name = "StageWindowLo_A"
+status = "confirmed"
+note = "Stage dirty-rect lo"
+
+[[site]]
+addr = 0x809442
+name = "StageWindowHi_A"
+status = "confirmed"
+note = "Stage dirty-rect hi"
+
+[[site]]
+addr = 0x80944B
+name = "StageWindowLo_B"
+status = "confirmed"
+note = "Stage dirty-rect lo (pair B)"
+
+[[site]]
+addr = 0x809452
+name = "StageWindowHi_B"
+status = "confirmed"
+note = "Stage dirty-rect hi (pair B)"
+
+[[site]]
+addr = 0x8093D8
+name = "BBoxRightAnd_A"
+status = "confirmed"
+note = "After STA $1E26 — widen WRAM"
+
+[[site]]
+addr = 0x8094A3
+name = "BBoxRightAnd_B"
+status = "confirmed"
+note = "After STA $1E2A — widen WRAM"
+
+[[site]]
+addr = 0x82837E
+name = "BBoxLeftBcc_Cam0"
+status = "confirmed"
+
+[[site]]
+addr = 0x828397
+name = "BBoxLeftBcc_Cam1"
+status = "confirmed"
+
+[[site]]
+addr = 0x828383
+name = "BBoxRightBcs_Cam0"
+status = "confirmed"
+
+[[site]]
+addr = 0x82839C
+name = "BBoxRightBcs_Cam1"
+status = "confirmed"
+
+[[site]]
+addr = 0x809B43
+name = "BBoxPaddedLeftBcc"
+status = "confirmed"
+
+[[site]]
+addr = 0x80A5AB
+name = "ObjOnscreenEntry"
+status = "confirmed"
+
+[[site]]
+addr = 0x80A5B6
+name = "ObjOnscreenBmi"
+status = "confirmed"
+
+[[site]]
+addr = 0x80A5BA
+name = "ObjOnscreenCmp"
+status = "confirmed"
+
+[[site]]
+addr = 0x80A5D7
+name = "ObjGfxCaller"
+status = "confirmed"
+
+[[site]]
+addr = 0x8483C6
+name = "ObjGateHeartbeat"
+status = "confirmed"
+
+[[site]]
+addr = 0x8283B2
+name = "DistLimitSta"
+status = "confirmed"
+
+[[site]]
+addr = 0x809A31
+name = "TilePatchSta7F"
+status = "confirmed"
+note = "STA $7F0000,X door/platform tile patches into shared $7F map (BG1 brown source for present rebuild)"
+
+[[site]]
+addr = 0x809A61
+name = "TileHelper_A"
+status = "confirmed"
+
+[[site]]
+addr = 0x809A83
+name = "TileHelper_B"
+status = "confirmed"
+
+[[site]]
+addr = 0x809A3E
+name = "TileHelper_C"
+status = "confirmed"
+
+[[site]]
+addr = 0x809280
+name = "PropListYGate_A"
+status = "confirmed"
+
+[[site]]
+addr = 0x8092A0
+name = "PropListYGate_B"
+status = "confirmed"
+
+[[site]]
+addr = 0x808704
+name = "DrawSx_1P_A"
+status = "confirmed"
+
+[[site]]
+addr = 0x808714
+name = "DrawSx_1P_B"
+status = "confirmed"
+
+[[site]]
+addr = 0x808721
+name = "DrawMeta_1P"
+status = "confirmed"
+
+[[site]]
+addr = 0x8087DE
+name = "DrawSx_H2H_A"
+status = "confirmed"
+
+[[site]]
+addr = 0x808802
+name = "DrawSx_H2H_B"
+status = "confirmed"
+
+[[site]]
+addr = 0x80881F
+name = "DrawMeta_H2H"
+status = "confirmed"
+
+[[site]]
+addr = 0x80882F
+name = "DrawPropReinforce"
+status = "confirmed"
+
+[[site]]
+addr = 0x8095A9
+name = "H2hTallerStripe"
+status = "confirmed"
+
+[[site]]
+addr = 0x8095AF
+name = "H2hDualViewHeight"
+status = "confirmed"
+
+[[site]]
+addr = 0x82F62A
+name = "SpawnYHeight"
+status = "confirmed"
+
+[[site]]
+addr = 0x82F709
+name = "H2hTallerSpawnY_A"
+status = "confirmed"
+
+[[site]]
+addr = 0x82F721
+name = "H2hTallerSpawnY_B"
+status = "confirmed"
+
+[[site]]
+addr = 0x82F733
+name = "H2hTallerSpawnY_C"
+status = "confirmed"
+
+[[site]]
+addr = 0x80B99B
+name = "H2hYBias_A"
+status = "confirmed"
+
+[[site]]
+addr = 0x80B9EF
+name = "H2hYBias_B"
+status = "confirmed"
+
+[[site]]
+addr = 0x84834C
+name = "H2hYBias_C"
+status = "confirmed"
+
+[[site]]
+addr = 0x809169
+name = "H2hOamClear"
+status = "confirmed"
+note = "Staging OAM clear — cam-tag reset"
+
+# ---------------------------------------------------------------------------
+# Site groups (arrays installed by mw_install_hooks)
+# ---------------------------------------------------------------------------
+
+[[site_group]]
+name = "SpriteWinCmp"
+status = "confirmed"
+note = "Meta-sprite OAM X window widen"
+addrs = [
+  0x808BD5, 0x808C85, 0x808CCE, 0x808D2E, 0x808DEE, 0x808E3E,
+  0x808E9E, 0x808F5E, 0x808FAE, 0x809015, 0x8090DC, 0x809133,
+]
+
+[[site_group]]
+name = "ParticleBmi"
+status = "confirmed"
+addrs = [0x80DC13, 0x80DC97, 0x80DCCF]
+
+[[site_group]]
+name = "ParticleBcs"
+status = "confirmed"
+addrs = [0x80DC18, 0x80DC9C, 0x80DCD4]
+
+[[site_group]]
+name = "ParticleAfterSta"
+status = "confirmed"
+addrs = [0x80DC1D, 0x80DCA1, 0x80DCD9]
+
+[[site_group]]
+name = "ActiveLoCmp"
+status = "confirmed"
+note = "CMP #$FFC0 after screen-X SBC"
+addrs = [0x80922E, 0x80926B, 0x80928B]
+
+[[site_group]]
+name = "ActiveHiCmp"
+status = "confirmed"
+note = "CMP #$0140 after screen-X lo"
+addrs = [0x809233, 0x809270, 0x809290]
+
+[[site_group]]
+name = "SpawnLeftSta"
+status = "confirmed"
+addrs = [0x82F703, 0x82F71B, 0x82F72D]
+
+[[site_group]]
+name = "SpawnHiCmp"
+status = "confirmed"
+addrs = [0x82F66A, 0x82F67B]
+
+[[site_group]]
+name = "SpawnLeftBmi"
+status = "confirmed"
+addrs = [0x82F668, 0x82F679]
+
+# ---------------------------------------------------------------------------
+# WRAM / objects (see also docs/H2H_STAGE_PROPS.md)
+# ---------------------------------------------------------------------------
+
+[[object]]
+addr = 0x1E14
+name = "ObjectListHead"
+type = "u16"
+status = "confirmed"
+note = "Live object list head → linked MwObject records. Coldump near[] walks this list."
+
+[[object]]
+addr = 0x1934
+name = "ObjectPoolBase"
+type = "MwObject"
+status = "confirmed"
+note = "Common object pool base; stride 0x1C through ~$2000. Pool slots recycle — coldump o= is not a stable identity; bind by meta+world, not address."
+
+# Observed H2H elev-room identities (coldump; pool slots recycle — do NOT
+# hardcode these WRAM addresses in host logic):
+#   $1A68 / $6760 — pool slots that host $C6A4 (meta recycles; not stable IDs)
+#   $1A14 — dual mech body meta $E442 / bank $00AD
+#   $19C0 — mech sub-object $E30E-class / $00AD (~2–3px off body)
+#   $C382 pins — mid-ledge (637|832,365), upstairs (220|1249,106),
+#      crate (220,621); hazard stripe+brown. Host: mw_prop_is_pinned_hazard.
+#   Soak suspects + manip queue: docs/H2H_STAGE_PROPS.md §8a / §8b.
+#
+# Giant hazard stand (FOV grid-snap) — soak suspects 2026-08-05:
+#   BEST: map collision + BG1 (feet often sky). NOT catalog pins.
+#   $C382 @ (637|832,365)/(220,106) — RULED OUT (manip); PROP_PIN_DY unset
+#      (regressed walls/items). Do not reuse pin FP as stand probe.
+#   (350,490) — meta recycles $C39E/$C3EC; list-prop probe skipped (not stand).
+#   $C38C (m=50060) bank $B1 item @ dy≈−14 on $1A68 — backpack-class when
+#      present. Not the stand.
+#   Mech $E442/$AD — body CHR.
+#   STAND MAP/BG1 probe (current): SNESRECOMP_MW_STAND_BG1=dump|mark|blank
+#      + coldump stand_bg1. Present-only; no FP/gap-fill/CHR allowlist.
+#   Absent: $62/$C8 hzd, $D5B8 elev, $C6A4 meta in props.
+#
+# $C6A4 (m=50852) — TWO roles (same meta; distinguish by geometry):
+#   1) ON-MECH PICKUP / backpack (common under P2 in chase dumps):
+#      near[] dx≈±4, dy≈−14; sticky $E4×2 (mox 0/−15, moy −10); origin
+#      t7f=$0200 (sky — no brown body). Present MUST follow live so OAM
+#      stays on the mech back. World-locking this tore the pickup off
+#      (use stuck far, oam off-screen, present.n→0). Pool $1A68 may
+#      show sibling meta $C38C (50060) with the same backpack geometry.
+#   2) Free-floating mover (not within ±48x/±32y of either mech): keep
+#      world-lock X+Y through cam_corr / remote; sticky $E4 only; brown
+#      latch only when not on-mech.
+# Giant hazard stand is NOT $C6A4 / $C38C backpack — BG1/map (plat.pres).
+# Feet / plat.coll = collision gate only; present origin varies (odx/ody).
+# plat.pres scores contiguous $7F/VRAM runs near coll + on-screen (not
+# widest far shelf — dump false latch west=896 odx=167 sx=342).
+# plat.stripe = $62/$C8 hazard OAM only (never $E4 backpack).
+# Lag: pres_world (d_pres_wx≈0) vs pres_lock (d_pres_wx≈dloc) while |dloc|≥2.
+#
+# GRID-SNAP STAND — collision ≠ paint (2026-08-05):
+#   Do NOT locate paint under mech feet. Feet sky / plat.under empty at coll
+#   only proves the split. Coldump paint{}: FOV BG1 cands + focus.lag
+#   (lock=FOV-follow, world=world-lock) and paint.oam[] — no feet gate.
+#   Identify which cand/oam is the circled hitching layer, then marry to coll.
+#   mw_bg1_vram_at_world: world tile row; view-rel X full-frame.
+#
+# FALSE LEAD (2026-08-05) — DO NOT revive CHR allowlist world-lock:
+#   Untagged poam t=$0A/$0C/$0E/$20/$22/$28/$40… under P2 feet with s:0 looked
+#   like "stand platform" when present.n=0 / no list prop. Those tiles are
+#   MECH body CHR (bank $00AD / meta $E442) — same cluster as $06/$08/$E4/$E6.
+#   Capture world-lock by tile id froze half the mech (sliced presentation).
+#   Identify platform present by object (whitelist meta / local_only / sticky
+#   $E4) or BG1/$7F map-brown — never raw tile-id allowlists on untagged OAM.
+#
+# Host-present paint (display-only — NOT sim collision):
+#   mw_rider_brown_paint → mw_bg1_paint_world writes BG1 VRAM only.
+#   Eligible: free (not on-mech) $C6A4 + pinned $C382. On-mech backpack
+#   clears brown latch. Pins paint catalog +$02/+$04 only. Scrub prior paint
+#   on XY move; clear on foreign home / sticky death. plat.stripe: $62/$C8 only.
+#   Mid-ledge neither-FOV → closer |sy|. Pin paint skip far_y.
+#   Gameplay OAM skips tiles latched in prop sticky (sticky path only).
+
+[[object]]
+addr = 0x14C4
+name = "OamStaging"
+type = "u8[512]"
+status = "confirmed"
+note = "OAM staging buffer (low table)"
+
+[[object]]
+addr = 0x16C4
+name = "OamStagingHi"
+type = "u8[32]"
+status = "confirmed"
+note = "High OAM bits; clear path walks $14C4 → $16C4"
+
+[[object]]
+addr = 0x00B6
+name = "Bg1MapPitch"
+type = "u16"
+status = "confirmed"
+note = "BG1 $7F row pitch in bytes; host falls back to $0290 if <32. Used by snap/present/coldump strip."
+
+[[object]]
+addr = 0x1E16
+name = "Cam0_X"
+type = "u16"
+status = "confirmed"
+note = "Camera 0 world X (NMI latch / present local for slot 0)"
+
+[[object]]
+addr = 0x1E18
+name = "Cam0_Y"
+type = "u16"
+status = "confirmed"
+
+[[object]]
+addr = 0x1E1A
+name = "Cam1_X"
+type = "u16"
+status = "confirmed"
+note = "Camera 1 world X (H2H dual; present local for slot 1)"
+
+[[object]]
+addr = 0x1E1C
+name = "Cam1_Y"
+type = "u16"
+status = "confirmed"
+
+[[object]]
+addr = 0x1E2E
+name = "ScrollH0_P1"
+type = "u16"
+status = "confirmed"
+note = "WRAM BG1 H scroll sample for P1 path (NMI). Full-frame present uses applied pscroll, not raw fine alone."
+
+[[object]]
+addr = 0x1E32
+name = "ScrollH0_P2"
+type = "u16"
+status = "confirmed"
+note = "NOT P2 world camera X — coldump d1h vs loc was always huge. Use Cam1_X / BG1 snap cam for P2 world."
+
+[[object]]
+addr = 0x1E42
+name = "ScrollH1_P1"
+type = "u16"
+status = "confirmed"
+note = "WRAM BG2 H scroll (P1 path)"
+
+[[object]]
+addr = 0x1E46
+name = "ScrollH1_P2"
+type = "u16"
+status = "confirmed"
+note = "WRAM BG2 H scroll (P2 path)"
+
+[[object]]
+addr = 0x1E5E
+name = "ScrollV0_P1"
+type = "u16"
+status = "confirmed"
+note = "WRAM BG1 V scroll (P1 path)"
+
+[[object]]
+addr = 0x1E60
+name = "ScrollV1_P1"
+type = "u16"
+status = "confirmed"
+note = "WRAM BG2 V scroll (P1 path)"
+
+[[object]]
+addr = 0x1E62
+name = "ScrollV0_P2"
+type = "u16"
+status = "confirmed"
+note = "WRAM BG1 V scroll (P2 path)"
+
+[[object]]
+addr = 0x1E64
+name = "ScrollV1_P2"
+type = "u16"
+status = "confirmed"
+note = "WRAM BG2 V scroll (P2 path)"
+
+[[object]]
+addr = 0x1E36
+name = "StripSrc_A"
+type = "u16"
+status = "confirmed"
+note = "BG1 strip source pointer ($7F base for DMA/present). Dual may stomp; per-cam snap fills voids."
+
+[[object]]
+addr = 0x1E38
+name = "StripSrc_B"
+type = "u16"
+status = "confirmed"
+note = "BG2 strip source pointer"
+
+[[object]]
+addr = 0x1EB2
+name = "DualViewportFlag"
+type = "u16"
+status = "confirmed"
+note = "Nonzero ⇒ H2H dual viewport active (MwIsDualViewport)"
+
+[[object]]
+addr = 0x0000
+name = "NmiHookPtr"
+type = "u8[3]"
+status = "confirmed"
+note = "24-bit NMI body pointer; normally $80:818A"
+
+# ---------------------------------------------------------------------------
+# Meta / bank catalog (not WRAM — documented for coldump + host filters)
+# Decimal coldump m= : $C6A4=50852, $C382=50050, $C38C=50060, $C39E=50078,
+#   $E442=58434, $D5B8=54712. Soak suspects: docs/H2H_STAGE_PROPS.md §8a.
+# ---------------------------------------------------------------------------
+# Bank $00B1 — movers / items / elevators (stage-prop whitelist is meta-gated)
+#   $C382 — hazard stripe + brown body (most common pin)
+#   $C39E — ledge/handoff prop (1118,490 forever-lock catalog)
+#   $C6A4 — on-mech backpack pickup (dx≈±4,dy≈−14, $E4×2) OR free mover;
+#           brown latch only when free (not near mech). NOT the giant stand.
+#   $C400 $C5F2 $C3EC $C3C4 — other whitelist movers
+#   $D5B8 — BG2 elevator (NOT stage-prop whitelist; elevs[] coldump)
+#   $9FE2 — pickup crate example; must NOT be local_only via bare meta≠0
+# Bank $00AD — dual mechs
+#   $E442 — mech body
+#   $E30E-class — mech sub (~2–3px off body)
+#   Common body OAM CHR near mech (s:0, NOT stage-prop sticky):
+#     $02/$04/$06/$08/$0A/$0C/$0E/$20/$22/$24/$26/$28… and $E4/$E6/$E8/$EA/$EC
+#     ($E4 also used by $C6A4 sticky — distinguish by prop_obj / local_only,
+#     not tile alone). Never world-lock these by CHR allowlist.
+# Render ink: $7F word $0200 = sky/empty sample (weak tile)
+
+# ---------------------------------------------------------------------------
+# Struct layouts
+# ---------------------------------------------------------------------------
+
+[[struct]]
+name = "MwObject"
+size = 0x1C
+status = "confirmed"
+note = "Heuristic object record — see docs/H2H_STAGE_PROPS.md §1"
+
+[[field]]
+struct = "MwObject"
+offset = 0x00
+name = "flags"
+type = "u16"
+note = "bit15 = active"
+
+[[field]]
+struct = "MwObject"
+offset = 0x02
+name = "world_x"
+type = "u16"
+
+[[field]]
+struct = "MwObject"
+offset = 0x04
+name = "world_y"
+type = "u16"
+
+[[field]]
+struct = "MwObject"
+offset = 0x06
+name = "dual_tag"
+type = "u16"
+note = "hi = viewport owner; lo = instance id (not home)"
+
+[[field]]
+struct = "MwObject"
+offset = 0x08
+name = "meta_lo"
+type = "u16"
+note = "sprite/meta id. See meta catalog above. Whitelist movers: $C382/$C39E/$C6A4/$C400/$C5F2/$C3EC/$C3C4. $D5B8=BG2 elev. $E442/$E30E=mech. Coldump m= is decimal."
+
+[[field]]
+struct = "MwObject"
+offset = 0x0A
+name = "meta_hi"
+type = "u16"
+note = "bank/class: $00B1 movers+items; $00AD dual mechs (body/sub). Coldump near[].cls uses bank + whitelist + dual_tag hi."
+
+[[field]]
+struct = "MwObject"
+offset = 0x0C
+name = "c"
+type = "u16"
+
+[[field]]
+struct = "MwObject"
+offset = 0x0E
+name = "e"
+type = "u16"
+note = "state / anim-ish"
+
+[[field]]
+struct = "MwObject"
+offset = 0x10
+name = "w10"
+type = "u16"
+
+[[field]]
+struct = "MwObject"
+offset = 0x12
+name = "w12"
+type = "u16"
+
+[[field]]
+struct = "MwObject"
+offset = 0x14
+name = "next"
+type = "u16"
+note = "next list link; remaining bytes to 0x1C are undocumented"
+
+# Sim vs present split (host, not guest WRAM):
+#   Sim authority — ObjectListHead + world_x/y on MwObject (+ map collision)
+#   Present — sticky OAM (home-only for whitelist) + BG1 from shared $7F
+#             + host brown latch/paint (VRAM only; see pool notes above)
+#   Stand platform with collision but no near prop / present.n=0:
+#     collision = guest sim; visible brown = BG1 present strip (view-rel+$fine HOFS).
+#   Map-brown swim with no near prop ⇒ strip/present/$7F path (§9 #16),
+#   not $C6A4 / orphan $62 OAM glue.
+# Sticky OAM tile ids (coldump tiles[].t / plat.stripe.t):
+#   $C382 hazard stripe — $62 (98); pin synthetic seed — $C8 (200)
+#   $C39E sticky — $0E (14) when s:1 + prop_obj; bare poam t=$0E s:0 is mech
+#   $C6A4 sticky — $E4 (228) only (backpack; NOT plat.stripe)
+#   poam t=10/12/14/32/34/40… s:0 = mech chunks, not stand
+# $7F / VRAM sky sample word — $0200 (decimal 512); solid mid-ledge brown
+#   often ~$5686 (22150) at pin origin+offset.

@@ -453,30 +453,29 @@ void RtlDrawPpuFrame(uint8 *pixel_buffer, size_t pitch, uint32 render_flags) {
   // 256 and this reduces to the authentic 256-wide copy — byte-identical to the
   // faithful build. Re-applied every frame because ppu_reset (soft reset /
   // load-state) zeroes the PPU's margin fields.
-  const int h2h_local_full =
-      snes_netplay_active() && MwIsDualViewport() && MwH2hFullFrameLocalArmed();
+  /* Netplay dual, or offline dual when COLDUMP / OFFLINE_LOCAL_FULL. */
   static int h2h_local = -1;
   if (h2h_local < 0) {
     const char *e = getenv("SNESRECOMP_MW_H2H_LOCAL_VIEW");
     h2h_local = (e && e[0] == '0') ? 0 : 1;
   }
-  const int use_local_full = h2h_local_full && h2h_local;
+  const int use_local_full = h2h_local && MwH2hShouldLocalFullPresent();
+  const int present_slot = MwH2hPresentLocalSlot();
 
   if (g_ws_active) {
     memset(g_my_pixels, 0, (size_t)g_snes_width * 4 * (size_t)g_snes_height);
     MwConfigureWidescreen();
   }
-  /* Netplay H2H: full 224-line local camera (real FOV). Fallback: split draw
-   * then half-crop when FULL_FRAME=0. */
+  /* Full 224-line local camera (real FOV). Fallback: split draw / half-crop. */
   if (use_local_full)
-    MwDrawPpuFrameLocalFull(snes_netplay_local_slot());
+    MwDrawPpuFrameLocalFull(present_slot);
   else
     g_rtl_game_info->draw_ppu_frame();
   RtlWidescreenPresent(pixel_buffer, pitch, g_my_pixels, g_snes_width, g_snes_height);
   /* Full-frame H2H: solid top bar + opponent direction (replaces dual-seam HUD). */
   if (use_local_full)
     MwPresentH2hTopBar(pixel_buffer, pitch, g_snes_width, g_snes_height,
-                       snes_netplay_local_slot());
+                       present_slot);
   /* Temporary offline verification: MW_CAP=<dir> writes periodic widescreen
    * PPMs of the present buffer. Zero cost when the env var is unset. */
   {

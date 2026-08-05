@@ -11,9 +11,16 @@ void MwDrawPpuFrame(void);
 /* Present-only: full 224-line framebuffer from one H2H camera (local slot
  * 0 = P1 / $1E2E,$1E5E; 1 = P2 / $1E32,$1E62). Default ON for netplay.
  * Opt out: SNESRECOMP_MW_H2H_FULL_FRAME=0 (legacy half-crop).
- * Column/mover offline dump: SNESRECOMP_MW_COLDUMP=path.jsonl (or =1). */
+ * Offline dual: ON when SNESRECOMP_MW_COLDUMP is set (or force with
+ * SNESRECOMP_MW_H2H_OFFLINE_LOCAL_FULL=1; off with =0). Slot via
+ * SNESRECOMP_MW_H2H_OFFLINE_SLOT=0|1 (default 0).
+ * Column/mover dump: SNESRECOMP_MW_COLDUMP=path.jsonl (or =1). */
 void MwDrawPpuFrameLocalFull(int local_slot);
 bool MwH2hFullFrameLocalArmed(void);
+/* True when RtlDrawPpuFrame should use LocalFull (netplay or offline diag). */
+bool MwH2hShouldLocalFullPresent(void);
+/* Presenting peer: netplay local slot, else OFFLINE_SLOT (0/1). */
+int MwH2hPresentLocalSlot(void);
 
 /* Present-only: solid top bar (masks top FOV transition) + opponent-direction
  * marker for full-frame H2H. Call after RtlWidescreenPresent. Opt out:

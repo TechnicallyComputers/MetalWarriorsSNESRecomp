@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Regen pipeline driver for MetalWarriorsSNESRecomp.
 #
-# Regenerates src/gen/*.c from the recomp/*.cfg configs over a verified
-# Metal Warriors (USA) ROM, then syncs recomp/funcs.h.
+# 1) Syncs recomp/symbols.toml → bank*.cfg + mw_symbols.h (partial decomp map)
+# 2) Regenerates src/gen/*.c from the recomp/*.cfg configs over a verified
+#    Metal Warriors (USA) ROM, then syncs recomp/funcs.h.
 #
 # Uses the snesrecomp local codegen SDK (snesrecomp_cli.py generate).
 #
@@ -71,6 +72,9 @@ if [ ! -f "$CLI" ]; then
 fi
 
 step() { echo; echo "=== $* ==="; }
+
+step "Syncing symbols.toml → bank cfgs + mw_symbols.h"
+"$PYTHON" "$ROOT/tools/sync_symbols.py"
 
 sdk_generate() {
   local out_dir="$1"

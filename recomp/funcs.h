@@ -15,8 +15,23 @@
 
 #include "cpu_state.h"
 
-/* 0 functions across all banks (5 decls each). */
+/* 3 functions across all banks (5 decls each). */
 
+void I_RESET(CpuState *cpu);  /* $00:80AE alias */
+RecompReturn I_RESET_M0X0(CpuState *cpu);
+RecompReturn I_RESET_M0X1(CpuState *cpu);
+RecompReturn I_RESET_M1X0(CpuState *cpu);
+RecompReturn I_RESET_M1X1(CpuState *cpu);
+void I_NMI(CpuState *cpu);  /* $00:8182 alias */
+RecompReturn I_NMI_M0X0(CpuState *cpu);
+RecompReturn I_NMI_M0X1(CpuState *cpu);
+RecompReturn I_NMI_M1X0(CpuState *cpu);
+RecompReturn I_NMI_M1X1(CpuState *cpu);
+void I_IRQ(CpuState *cpu);  /* $00:8224 alias */
+RecompReturn I_IRQ_M0X0(CpuState *cpu);
+RecompReturn I_IRQ_M0X1(CpuState *cpu);
+RecompReturn I_IRQ_M1X0(CpuState *cpu);
+RecompReturn I_IRQ_M1X1(CpuState *cpu);
 
 /* Hand-written non-recompiled bodies still declared here.
  * These are not produced by the v2 emit pipeline but are
