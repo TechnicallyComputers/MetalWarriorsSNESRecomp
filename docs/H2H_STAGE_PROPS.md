@@ -18,7 +18,8 @@ platforms, plates) and related bank-`$00B1` objects. Implementation lives in
 | `SNESRECOMP_MW_PROP_PIN_DY`        | Extra pixels on pinned `$C382` present `moy` — **leave unset** (step1 regress) |
 | `SNESRECOMP_MW_PROP_C39E_DX`/`_DY` | List-prop probe — **skip** (step2 wrong meta / not stand) |
 | `SNESRECOMP_MW_STAND_BG1`          | Map/BG1 stand probe: `dump` / `mark` / `blank` (see §8b step 3) |
-| `SNESRECOMP_MW_STAND_BG1_WX`/`_WY` | Optional world origin override (default: local mech) |
+| `SNESRECOMP_MW_STAND_BG1_AT`       | Origin: `auto` (default) / `mid` / `pres` / `focus` / `mech` |
+| `SNESRECOMP_MW_STAND_BG1_WX`/`_WY` | Optional world origin override |
 | `SNESRECOMP_MW_ELEV=1`             | Verbose stderr object + VRAM dump (floods terminal) |
 | `SNESRECOMP_MW_COLS=1`             | Older column / margin logs                          |
 
@@ -498,54 +499,82 @@ the long-term paint model.
 applied). Far from feet; `near` often mechs-only. **Skip further list-prop
 manip** for the giant stand; leave `PROP_C39E_*` unset.
 
-### Step 3 — Map / BG1 under feet  ← **current**
+### Step 3 — Map / BG1 (split stand)  ← **current**
 
 Best model after pins + empty/mechs-only `near`: collision = map; paint =
-present BG1 (often sky at feet). **No** gap-fill, FP blank, or CHR allowlist.
+present BG1. Soak (`/tmp/mw_b.jsonl`, 2026-08-05) shows **two BG1 bands**,
+same tile **`$1600` (5632)**:
+
+| Band | Coldump | sy (approx) | wy (approx) | Pan behavior |
+| ---- | ------- | ----------- | ----------- | ------------ |
+| Top (stripe / upper brown) | `plat.pres` / `body` | ~59 | ~728 | **WORLD** (`d_sx≈−dloc`) — snaps with cam |
+| Bottom (lower brown) | `paint.mid` (also `focus`/`vis`) | ~91–107 (sticky also ~43) | ~760–776 | **SCREEN_FIXED** (`d_sx≈0`) |
+
+Hazard OAM absent (`hzd`/`spr` ok0). Feet: `$7F` sky, VRAM brown. Seam on
+screen = these two rows disagreeing. **No** gap-fill / FP blank / CHR allowlist.
 
 **Lever:** `SNESRECOMP_MW_STAND_BG1` (present-only, VRAM-restored):
 
 | Value   | Effect |
 | ------- | ------ |
-| `dump`  | Sample `$7F` + VRAM grid around origin (auto with COLDUMP too) |
-| `mark`  | XOR solid VRAM; paint `$1600` into sky cells — stand flickers ⇒ married |
-| `blank` | Sky-fill solid VRAM in grid — stand vanishes ⇒ married |
+| `dump`  | Sample `$7F` + VRAM grid (also with COLDUMP) |
+| `mark`  | XOR solid VRAM; paint `$1600` into sky — band flickers ⇒ married |
+| `blank` | Sky-fill solid VRAM — band vanishes ⇒ married |
 
-Origin = local dual mech, or `STAND_BG1_WX` / `STAND_BG1_WY`. Grid:
-`dx∈[-48,+48]`, `dy∈[-16,+96]` step 16. Coldump: `stand_bg1`.
+**Origin** `SNESRECOMP_MW_STAND_BG1_AT` (default `auto`):
 
-**Session**
+| AT | Uses |
+| -- | ---- |
+| `auto` | live `$1600` scan (raw cam Y) → per-slot mid/pres latch |
+| `mid` | scan sy≈80–130 then mid latch (bottom / screen-fixed) |
+| `pres` | scan sy≈40–80 then pres latch (top / world) |
+| `focus` | scan sy≈20–60 |
+| `mech` | local dual mech only (explicit; mark/blank never soft-fallback here) |
+
+Scan uses **raw** `cam_y` for `sy` (not `v0`/y_bg). Tries present **VRAM**
+then **`$7F`**. Per-slot latches survive the other peer’s coldump (on-screen
+sx only — rejects east-shelf false latches). `src=miss` + `ok:0` when nothing
+found (mark/blank no longer silent `mode:off`). `present.slot` is set by
+LocalFull even when object-drawer OAM skips cam_capture.
+
+Optional `STAND_BG1_WX`/`_WY`. Coldump: `stand_bg1.{mode,src,ox,oy,…}`.
+Grid around origin covers both seam bands (`dy∈[-80,+64]`).
+
+**Session — hit each band**
 
 ```bash
 : > /tmp/mw_a.jsonl
 # Do NOT set PROP_PIN_DY / PROP_C39E_*
+# 1) screen-fixed bottom
 SNESRECOMP_MW_COLDUMP=/tmp/mw_a.jsonl SNESRECOMP_MW_COLDUMP_EVERY=1 \
 SNESRECOMP_MW_H2H_OFFLINE_SLOT=1 \
 SNESRECOMP_MW_STAND_BG1=mark \
+SNESRECOMP_MW_STAND_BG1_AT=mid \
+  ./build-linux-prod/MetalWarriorsSNESRecomp
+
+# 2) world top (after a few frames of mid so latches exist, or use auto)
+SNESRECOMP_MW_STAND_BG1_AT=pres SNESRECOMP_MW_STAND_BG1=blank \
   ./build-linux-prod/MetalWarriorsSNESRecomp
 ```
 
-Then try `STAND_BG1=blank`. Unset when done.
+Unset when done. Prefer truncate between runs.
 
 **Watch**
 
-- `stand_bg1.solid7f` / `solidv` / `touched` while on stand (`OFFLINE_SLOT=1`).
-- Visual: does the **circled stand** mark/blank, or only floor/sky beside it?
-- If `solidv==0` under feet, ink is elsewhere — try `STAND_BG1_WX/WY` at a
-  visible brown world XY, or pan while watching `paint.fix` lag.
+- `stand_bg1.src` is `mid`/`pres`/`scan` (not stuck on `mech` with `solidv=0`).
+- **mark/blank mid:** bottom circle should change; top may not.
+- **mark/blank pres:** top/world band should change; bottom may stay glued.
+- JSON must parse (`jq .` on a line) — bg2 close was fixed 2026-08-05.
 
 ```bash
 jq -c 'select(.slot==1)|{f,mech1:.mechs[1],sb:.stand_bg1|
-  {mode,ox,oy,solid7f,solidv,touched,n:(.cells|length)}}' \
-  /tmp/mw_a.jsonl | head -20
-
-# Non-sky cells in the probe grid
-jq -c 'select(.slot==1)|.stand_bg1.cells[]?|select(.tv0!=512 and .tv0!=0)|
-  {dx,dy,t7f,tv0,tv1}' /tmp/mw_a.jsonl | head -40
+  {mode,src,ox,oy,solid7f,solidv,touched},
+  mid:(.paint.mid|{ok,sx,sy,wx,wy,t}),
+  pres:(.plat.pres|{ok,sx,sy,wx,wy,t})}' /tmp/mw_a.jsonl | head -20
 ```
 
-**Log outcome here when done:** (pending) — stand marked/blanked? Y/N;
-`solidv` under feet; map walls OK?
+**Log outcome here when done:** (pending) — mid band hit? Y/N; pres band hit?
+Y/N; which matches each circle?
 
 ---
 
@@ -617,14 +646,24 @@ not widen; no fingerprint paint.
     should rise well above ~10; P2 home pin brown stable at top edge (`sy≈-14`).
 16. Mid-view stand “follows cam in grid snaps opposite pan”:
     **Collision ≠ paint.** Hitching layer = present BG1 VRAM (not OAM).
-    **Do not** invent feet ink / neighbor gap-fill (2026-08-05 — corrupted
-    map BG, zero effect on hitch). Prefer `paint.fix` (fixed 128,100 VRAM/OAM) + `paint.spr` (away-from-mech).
-    Prior `spr` latched mech `$22/$26`. `mid` `$1200` is world-locked (fine).
-    Pan while hitching — static `loc` proves nothing.
-    `vis.lag`: `lock`/`snap` + `d_sx≈0` = view-column follow. Keep view-rel
-    X + `h0_ppu=cam&15`; no FP blank / uncapped snap X-remap. **Do not**
-    write soak into `symbols.toml` until the hitching surface is ID'd and
-    fixed.
+    Soak: same tile `$1600` — top `plat.pres` WORLD, bottom `paint.mid`
+    SCREEN_FIXED (horizontal seam). Cause: dual `$7F` peer strip poisoned
+    per-slot snap (blind NMI/present capture) while full-frame rebuild
+    refused snap-fill, so some rows stayed on view-sticky live ink.
+    Fix (2026-08-05): full-frame prefer snap when live `$1E36` is foreign;
+    void→snap then sky. Keep view-rel X + `h0_ppu=cam&15`.
+17. **Netplay P2 underfeet sky / grid snap (2026-08-05):** LocalFull on
+    slot 1 with `src_loc` ≠ `src1` (peer DMA). An ownership gate on
+    derived 42B3 snap capture refused refresh whenever live was foreign →
+    P2 snap starved; rebuild wrote `$0200` under the mech
+    (`feet.t7f=tvram=512`, `strip.lag.solid=0`) while far false
+    `plat.pres` (`odx≈200`) still WORLD-locked. Coldump: trust
+    `present.slot==slot` (dual-slot lines with `ps:-1` inherit the other
+    peer’s `pscroll`). Fix: always attempt local-42B3 snap; when live
+    foreign, merge prior solid into newly weak native snap cells; rebuild
+    yields solid snap over weak/sky live (not void-only); world-abs `$7F`
+    fallback before sky. Verify on P2: `present.slot==1`,
+    `feet.weak→0` / `strip.lag.solid>0` while on the circled stand.
 
 Named guest symbols (`recomp/symbols.toml`): `MwObject`, `ObjectListHead`,
 `ObjectPoolBase`, `Cam0_X`/`Cam1_X`, `Bg1MapPitch` (`$00B6`), `StripSrc_A/B`,
@@ -637,6 +676,11 @@ Named guest symbols (`recomp/symbols.toml`): `MwObject`, `ObjectListHead`,
 
 | Date       | Note                                                                                                                                                                                                                                                                          |
 | ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| 2026-08-05 | Netplay P2 underfeet sky: drop starve-gate on 42B3 snap; foreign-live native snap merge; weak→snap + world-abs `$7F` before sky.                                                                     |
+| 2026-08-05 | Stand hitch: prefer snap when live DMA foreign (unify `$1600` SCREEN_FIXED mid → WORLD). Ownership gate later starved P2 — see #17.                                                                   |
+| 2026-08-05 | STAND_BG1: `src=miss` emit; `$7F` scan + stamp; latch sx gate; LocalFull always sets `present.slot`.                                                                                                |
+| 2026-08-05 | STAND_BG1: live `$1600` scan with raw cam Y; per-slot mid/pres latch; no mech sky-stamp on mark/blank.                                                                                              |
+| 2026-08-05 | Stand split: `$1600` WORLD `pres` (top) vs SCREEN_FIXED `mid` (bottom). `STAND_BG1_AT=mid\|pres`; fix coldump bg2/`stand_bg1` JSON.                                                                    |
 | 2026-08-05 | Skip list props: step2 `$C39E` miss (`$C3EC` at XY). Step3 map/BG1 via `STAND_BG1=dump\|mark\|blank` + coldump `stand_bg1`.                                                                              |
 | 2026-08-05 | Step1 `$C382` pins ruled out; `PROP_PIN_DY` left unset (wall/item regress). Step2 `$C39E`@350,490 via `PROP_C39E_DX`/`_DY`.                                                                                    |
 | 2026-08-05 | §8a soak suspects + §8b manip queue; start with `$C382` pins + `PROP_PIN_DY`. `$C38C` backpack note.                                                                                                          |

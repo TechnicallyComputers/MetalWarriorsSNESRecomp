@@ -224,10 +224,11 @@ static uint16_t mw_7f_off_from_world(uint16_t world_x, uint16_t world_y);
 static void mw_stand_bg1_probe(int local_slot, uint16_t cam_x, uint16_t cam_y,
                                uint16_t scroll_x, uint16_t scroll_y);
 /* Filled by mw_stand_bg1_probe (present); emitted in coldump stand_bg1. */
-enum { kMwStandBg1Max = 56 };
+enum { kMwStandBg1Max = 96 };
 static struct {
   int slot;
   char mode[8];
+  char src[12]; /* mech|pres|mid|focus|env|scan|latch */
   int mx, my, ox, oy;
   int n_solid7f, n_solidv, n_touched, n_cells;
   int16_t dx[kMwStandBg1Max];
@@ -236,6 +237,12 @@ static struct {
   uint16_t tv0[kMwStandBg1Max];
   uint16_t tv1[kMwStandBg1Max];
 } s_stand_bg1;
+/* Per-slot stand blob latches — survive the other peer's coldump clearing
+ * global mid/pres have flags. Updated when paint.mid / plat.pres succeed. */
+static int s_stand_latch_mid_wx[2], s_stand_latch_mid_wy[2];
+static int s_stand_latch_pres_wx[2], s_stand_latch_pres_wy[2];
+static uint8_t s_stand_latch_mid_have[2];
+static uint8_t s_stand_latch_pres_have[2];
 /* Near-mech motion trail for coldump `near[]` (any list meta, not just props). */
 enum { kMwColdumpNearMot = 32 };
 static uint16_t s_coldump_near_obj[kMwColdumpNearMot];
@@ -1868,7 +1875,15 @@ static uint16_t mw_bg1_vram_at_world(uint16_t world_x, uint16_t world_y,
 }
 
 /* Snapshot one cam's BG1 strip out of $7F (survives dual VRAM stomps).
- * Columns are relative to src: [-kMwBg1SnapWest, +span). */
+ * Columns are relative to src: [-kMwBg1SnapWest, +span).
+ *
+ * Dual: src_opt from DMA note is always trusted. Derived 42B3 captures
+ * always attempt a read of *this cam's* window — a prior ownership gate
+ * (require live $1E36 near local src) starved P2 snap whenever peer DMA
+ * was active (netplay: src1≢src_loc → underfeet strip stayed sky). All-
+ * weak captures still keep the prior solid snap. When live DMA is foreign,
+ * merge prior solid into newly weak native cells (same column only) so a
+ * half-stomped $7F window does not erase a good snap. */
 static void mw_bg1_snap_capture(int slot, uint16_t cam_x, uint16_t cam_y,
                                 uint16_t src_opt) {
   uint16_t words[kMwBg1SnapRows][kMwBg1SnapCols];
@@ -1881,6 +1896,10 @@ static void mw_bg1_snap_capture(int slot, uint16_t cam_x, uint16_t cam_y,
     src = mw_map_src_from_42b3(cam_x, cam_y);
   if (!src)
     return;
+  const uint16_t live =
+      s_nmi_latched ? s_nmi_src_bg1 : mw_wram16(0x1E36u);
+  const int live_owned =
+      live && mw_bg1_src_near_column(src, live, pitch, 2);
   const int col_lo = -kMwBg1SnapWest;
   const int col_hi = kMwBg1SnapCols - kMwBg1SnapWest;
   memset(words, 0, sizeof(words));
@@ -1904,12 +1923,16 @@ static void mw_bg1_snap_capture(int slot, uint16_t cam_x, uint16_t cam_y,
   /* Dual often stomps only the 17-col stripe; west of src goes void while
    * the strip stays solid. Merging keeps prior west history for the left
    * widescreen gutter (DMA pad_left is always 0).
-   * Do NOT merge/reject native-strip cells here — that frozen stale terrain
-   * and (with tall pin FP blank) re-shattered floors/walls (2026-08-04). */
+   * When live DMA is foreign, also keep prior solid native cells that this
+   * capture read as weak — otherwise P2's snap collapses to sky and present
+   * void→sky punches underfeet holes. Do not merge when live-owned (that
+   * froze terrain / re-shattered floors with tall pin FP — 2026-08-04). */
   if (snap->valid && snap->src &&
       mw_bg1_src_same_column(src, snap->src, pitch)) {
+    const int merge_hi =
+        live_owned ? kMwBg1SnapWest : kMwBg1SnapCols;
     for (int row = 0; row < kMwBg1SnapRows; row++) {
-      for (int c = 0; c < kMwBg1SnapWest; c++) {
+      for (int c = 0; c < merge_hi; c++) {
         if (mw_bg1_tile_weak(words[row][c]) &&
             !mw_bg1_tile_weak(snap->words[row][c]))
           words[row][c] = snap->words[row][c];
@@ -4683,13 +4706,22 @@ static void mw_coldump_tick(int local_slot) {
       poam_n++;
     }
   }
-  fprintf(s_coldump_fp,
-          ",\"cap\":{\"n\":[%u,%u],\"lo\":[%u,%u]},"
-          "\"present\":{\"slot\":%d,\"f\":%d,\"n\":%u,\"raw\":%u,"
-          "\"skip_own\":%u,\"skip_y\":%u},\"poam\":[",
-          s_elev_cap_n0, s_elev_cap_n1, s_elev_cap_lo0, s_elev_cap_lo1,
-          s_coldump_present_slot, s_coldump_present_frame, s_coldump_prop_n,
-          s_coldump_prop_raw, s_coldump_skip_own, s_coldump_skip_y);
+  /* Only attribute present.* to the slot LocalFull just drew — elev dual-tick
+   * of the other peer must not inherit slot/f/n from the presented cam. */
+  {
+    const int present_here = (s_coldump_present_slot == slot) ? 1 : 0;
+    fprintf(s_coldump_fp,
+            ",\"cap\":{\"n\":[%u,%u],\"lo\":[%u,%u]},"
+            "\"present\":{\"slot\":%d,\"f\":%d,\"n\":%u,\"raw\":%u,"
+            "\"skip_own\":%u,\"skip_y\":%u},\"poam\":[",
+            s_elev_cap_n0, s_elev_cap_n1, s_elev_cap_lo0, s_elev_cap_lo1,
+            present_here ? s_coldump_present_slot : -1,
+            present_here ? s_coldump_present_frame : -1,
+            present_here ? s_coldump_prop_n : 0u,
+            present_here ? s_coldump_prop_raw : 0u,
+            present_here ? s_coldump_skip_own : 0u,
+            present_here ? s_coldump_skip_y : 0u);
+  }
   for (unsigned i = 0; i < poam_n; i++) {
     fprintf(s_coldump_fp, "%s{\"x\":%d,\"y\":%d,\"t\":%u,\"s\":%u}",
             i ? "," : "", poam_x[i], poam_y[i], poam_t[i],
@@ -5489,6 +5521,15 @@ static void mw_coldump_tick(int local_slot) {
       s_coldump_plat_stripe_ok = (uint8_t)stripe_ok;
       s_coldump_plat_pres_ok = (uint8_t)pres_ok;
       s_coldump_plat_have = 1;
+      if (pres_ok && (slot == 0 || slot == 1)) {
+        const int psx = pres_wx - (int)loc_x;
+        /* Skip far-east shelf false wins (soak wx≈912 / sx≈314). */
+        if (psx >= -64 && psx < 320) {
+          s_stand_latch_pres_wx[slot] = pres_wx;
+          s_stand_latch_pres_wy[slot] = pres_wy;
+          s_stand_latch_pres_have[slot] = 1;
+        }
+      }
     }
   }
 
@@ -6337,6 +6378,11 @@ static void mw_coldump_tick(int local_slot) {
       s_coldump_mid_wy = cands[mid].wy;
       s_coldump_mid_locx = loc_x;
       s_coldump_mid_have = 1;
+      if (slot == 0 || slot == 1) {
+        s_stand_latch_mid_wx[slot] = cands[mid].wx;
+        s_stand_latch_mid_wy[slot] = cands[mid].wy;
+        s_stand_latch_mid_have[slot] = 1;
+      }
     }
 
     fprintf(s_coldump_fp,
@@ -6428,15 +6474,17 @@ static void mw_coldump_tick(int local_slot) {
             (int)s_bg2_rom_row_owner[r]);
     bg2_row_out++;
   }
-  /* Only emit probe for the slot that just presented (avoid elev dual-tick
-   * copying the other peer's stand_bg1). */
-  if (s_stand_bg1.n_cells > 0 && s_stand_bg1.slot == slot) {
+  /* Close bg2.rows + bg2 object before sibling keys (stand_bg1 / meta7e). */
+  fprintf(s_coldump_fp, "]}");
+  /* Emit for the presented slot even on src=miss (n_cells==0). */
+  if (s_stand_bg1.mode[0] && s_stand_bg1.slot == slot) {
     fprintf(s_coldump_fp,
-            ",\"stand_bg1\":{\"mode\":\"%s\",\"slot\":%d,"
-            "\"mx\":%d,\"my\":%d,\"ox\":%d,\"oy\":%d,"
+            ",\"stand_bg1\":{\"mode\":\"%s\",\"src\":\"%s\",\"slot\":%d,"
+            "\"ok\":%d,\"mx\":%d,\"my\":%d,\"ox\":%d,\"oy\":%d,"
             "\"solid7f\":%d,\"solidv\":%d,\"touched\":%d,\"cells\":[",
-            s_stand_bg1.mode[0] ? s_stand_bg1.mode : "off", s_stand_bg1.slot,
-            s_stand_bg1.mx, s_stand_bg1.my, s_stand_bg1.ox, s_stand_bg1.oy,
+            s_stand_bg1.mode, s_stand_bg1.src[0] ? s_stand_bg1.src : "?",
+            s_stand_bg1.slot, s_stand_bg1.n_cells > 0 ? 1 : 0, s_stand_bg1.mx,
+            s_stand_bg1.my, s_stand_bg1.ox, s_stand_bg1.oy,
             s_stand_bg1.n_solid7f, s_stand_bg1.n_solidv,
             s_stand_bg1.n_touched);
     for (int i = 0; i < s_stand_bg1.n_cells; i++) {
@@ -6868,18 +6916,25 @@ static void mw_present_rebuild_layer_strip(int layer, uint16_t cam_x,
   /* Full-frame BG1: view-relative X (game DMA col 0); Y stays world row. */
   const int view_rel_x = (layer == 0 && s_present_h2h_full_frame);
 
-  /* Prefer live $7F; snap fills dual-stomped voids. Allow ±1 tile column
-   * (fine/coarse DMA lag) — not free X remap (map shatter).
-   * Full-frame H2H: NEVER snap-fill native cols — stale snap words are
-   * view-column–sticky and produce paint.focus 16px FOV snaps (d_wx=±16
-   * on coarse). Void → sky; live $7F only. */
+  /* Prefer live $7F; snap fills dual-stomped voids/sky (±1 tile column).
+   * Full-frame: also prefer snap when live DMA $1E36 is foreign — peer
+   * solid in $7F is view-column–sticky (stand mid band SCREEN_FIXED).
+   * Weak ($0200) live must yield to solid snap too — void-only fill left
+   * underfeet sky when dual wrote sky into the stripe (netplay P2). */
   const int use_snap =
-      !(layer == 0 && s_present_h2h_full_frame) &&
       (layer == 0 && (local_slot == 0 || local_slot == 1) &&
        s_bg1_snap[local_slot].valid &&
        mw_bg1_src_near_column(src, s_bg1_snap[local_slot].src, pitch, 1) &&
        ((int)s_bg1_snap[local_slot].cam_x - (int)scroll_x <= 24 &&
         (int)s_bg1_snap[local_slot].cam_x - (int)scroll_x >= -24));
+  const uint16_t live_dma =
+      (layer == 0)
+          ? (s_nmi_latched ? s_nmi_src_bg1 : mw_wram16(0x1E36u))
+          : 0;
+  const int prefer_snap =
+      (layer == 0 && s_present_h2h_full_frame && use_snap && live_dma && src &&
+       !mw_bg1_src_near_column(src, live_dma, pitch, 1));
+  const int tile_px = 1 << (int)sh;
 
   /* Foreign-ink filter: latched present cams only (never re-read WRAM). */
   const uint16_t filt_c0x =
@@ -6926,8 +6981,31 @@ static void mw_present_rebuild_layer_strip(int layer, uint16_t cam_x,
       const int byte_off = (int)src + row * (int)pitch + col * 2;
       if (byte_off >= 0 && byte_off + 1 < 0x10000)
         t = mw_read7f16((uint16_t)byte_off);
-      if (mw_bg1_tile_void(t) && use_snap)
-        t = mw_bg1_snap_word(local_slot, src, pitch, row, col);
+      if (use_snap) {
+        const uint16_t ts =
+            mw_bg1_snap_word(local_slot, src, pitch, row, col);
+        /* Solid snap wins over void/sky live; prefer_snap also replaces
+         * peer-sticky solid live when DMA is foreign. */
+        if (!mw_bg1_tile_weak(ts) &&
+            (mw_bg1_tile_weak(t) || prefer_snap))
+          t = ts;
+      }
+      /* Stripe-relative $7F can miss a cell that world 42B3 still holds
+       * (non-linear row bases / dual stomp). Try world-abs before sky. */
+      if (layer == 0 && s_present_h2h_full_frame && mw_bg1_tile_weak(t) &&
+          col >= 0) {
+        const int wx = (int)scroll_x + col * tile_px + tile_px / 2;
+        const int wy = (int)scroll_y + row * tile_px + tile_px / 2;
+        if (wx >= 0 && wy >= 0) {
+          const uint16_t woff =
+              mw_7f_off_from_world((uint16_t)wx, (uint16_t)wy);
+          if (woff) {
+            const uint16_t tw = mw_read7f16(woff);
+            if (!mw_bg1_tile_weak(tw))
+              t = tw;
+          }
+        }
+      }
       if (mw_bg1_tile_void(t)) {
         if (col < 0) {
           /* West gutter still undecoded — leave miss/transparent. */
@@ -6950,7 +7028,6 @@ static void mw_present_rebuild_layer_strip(int layer, uint16_t cam_x,
        */
       if (layer == 0 && s_present_h2h_full_frame && col >= 0 &&
           col < view_cols && !mw_bg1_tile_void(t) && t != 0x0200u) {
-        const int tile_px = 1 << (int)sh;
         const int wx = (int)scroll_x + col * tile_px + tile_px / 2;
         const int wy = (int)scroll_y + row * tile_px + tile_px / 2;
         if (mw_prop_foreign_ink_tile(wx, wy, t, local_slot, filt_c0x, filt_c0y,
@@ -7091,11 +7168,12 @@ static void mw_bg1_write_world(uint16_t wx, uint16_t wy, uint16_t scroll_x,
 /*
  * Giant-stand map/BG1 soak probe (list props skipped — see H2H_STAGE_PROPS §8b).
  * Present-only; restored with VRAM save. Env SNESRECOMP_MW_STAND_BG1=
- *   dump  — sample $7F/VRAM grid around origin (default: local mech)
- *   mark  — XOR solid VRAM + paint $1600 into sky cells (visible hitch test)
- *   blank — sky-fill solid VRAM in the grid (stand vanishes ⇒ married)
- * Optional SNESRECOMP_MW_STAND_BG1_WX / _WY override world origin.
- * Coldump field stand_bg1. No FP blank / gap-fill / CHR allowlist.
+ *   dump / mark / blank
+ * Origin SNESRECOMP_MW_STAND_BG1_AT (default auto):
+ *   auto|mid|pres|focus — live $1600 scan (raw cam Y for sy) → per-slot latch
+ *   mech — local dual mech only (explicit)
+ * Optional STAND_BG1_WX/_WY. mark/blank never fall back to mech (sky stamp).
+ * sy uses loc_y=cam_y_raw; VRAM X uses scroll_x=h0 (view-rel).
  */
 static int mw_stand_bg1_mode(void) {
   static int inited, mode;
@@ -7103,67 +7181,83 @@ static int mw_stand_bg1_mode(void) {
     inited = 1;
     const char *e = getenv("SNESRECOMP_MW_STAND_BG1");
     if (!e || !e[0] || e[0] == '0')
-      mode = 0; /* off — still dump samples when coldump runs via dump path */
+      mode = 0;
     else if (!strcmp(e, "mark"))
       mode = 2;
     else if (!strcmp(e, "blank"))
       mode = 3;
     else
-      mode = 1; /* dump / 1 / anything else */
+      mode = 1;
   }
   return mode;
 }
 
-static void mw_stand_bg1_probe(int local_slot, uint16_t cam_x, uint16_t cam_y,
-                               uint16_t scroll_x, uint16_t scroll_y) {
-  memset(&s_stand_bg1, 0, sizeof(s_stand_bg1));
-  s_stand_bg1.slot = local_slot;
-  const int mode = mw_stand_bg1_mode();
-  /* Always sample when COLDUMP armed so feet/$7F marriage is visible;
-   * mutate only for mark/blank. */
-  if (!mw_coldump_armed() && mode < 2)
-    return;
-  if (mode == 2)
-    snprintf(s_stand_bg1.mode, sizeof(s_stand_bg1.mode), "mark");
-  else if (mode == 3)
-    snprintf(s_stand_bg1.mode, sizeof(s_stand_bg1.mode), "blank");
-  else
-    snprintf(s_stand_bg1.mode, sizeof(s_stand_bg1.mode), "dump");
-
-  int mx = 0, my = 0;
-  const int have_mech = mw_find_dual_mech_xy(local_slot, &mx, &my);
-  s_stand_bg1.mx = have_mech ? mx : -1;
-  s_stand_bg1.my = have_mech ? my : -1;
-  int ox = mx, oy = my;
-  {
-    const char *ex = getenv("SNESRECOMP_MW_STAND_BG1_WX");
-    const char *ey = getenv("SNESRECOMP_MW_STAND_BG1_WY");
-    if (ex && ex[0])
-      ox = atoi(ex);
-    if (ey && ey[0])
-      oy = atoi(ey);
+/*
+ * Prefer solid $1600 near mech with screen Y in [sy_lo,sy_hi].
+ * from_7f=0 → present VRAM; =1 → $7F map (stand often sky in VRAM).
+ * loc_y = raw present cam Y. scroll_x = h0 for VRAM / sx score.
+ */
+static int mw_stand_bg1_scan_blob(int mx, int my, uint16_t scroll_x,
+                                  uint16_t loc_y, int sy_lo, int sy_hi,
+                                  int from_7f, int *ox, int *oy) {
+  if (!ox || !oy)
+    return 0;
+  if (!from_7f && !g_ppu)
+    return 0;
+  int best = 0x7fffffff;
+  int bx = 0, by = 0, found = 0;
+  for (int dy = -80; dy <= 128; dy += 16) {
+    for (int dx = -96; dx <= 96; dx += 16) {
+      const int wx = mx + dx;
+      const int wy = my + dy;
+      const int sy = wy - (int)loc_y;
+      if (sy < sy_lo || sy > sy_hi)
+        continue;
+      uint16_t t = 0;
+      if (from_7f) {
+        const uint16_t off =
+            mw_7f_off_from_world((uint16_t)wx, (uint16_t)wy);
+        if (!off)
+          continue;
+        t = mw_read7f16(off);
+      } else {
+        t = mw_bg1_vram_at_world((uint16_t)wx, (uint16_t)wy, scroll_x,
+                                 loc_y);
+      }
+      if (mw_bg1_tile_weak(t))
+        continue;
+      int score = dx * dx / 4 + dy * dy / 4;
+      if (t == 0x1600u)
+        score -= 50000;
+      /* Prefer on-screen; reject far-east shelf latch (sx≫256). */
+      {
+        const int sx = wx - (int)scroll_x;
+        if (sx < -64 || sx >= 320)
+          score += 20000;
+        const int adx = sx - 160;
+        score += (adx < 0 ? -adx : adx);
+      }
+      if (score < best) {
+        best = score;
+        bx = wx;
+        by = wy;
+        found = 1;
+      }
+    }
   }
-  if ((!have_mech && !(getenv("SNESRECOMP_MW_STAND_BG1_WX") &&
-                       getenv("SNESRECOMP_MW_STAND_BG1_WY"))) ||
-      ox < 0 || oy < 0)
-    return;
-  s_stand_bg1.ox = ox;
-  s_stand_bg1.oy = oy;
+  if (!found)
+    return 0;
+  *ox = bx;
+  *oy = by;
+  return 1;
+}
 
-  static int logged;
-  if (!logged && mode >= 2) {
-    logged = 1;
-    fprintf(stderr,
-            "[mw_rtl] STAND_BG1=%s origin=(%d,%d) slot=%d — present-only; "
-            "unset when done\n",
-            s_stand_bg1.mode, ox, oy, local_slot);
-  }
-
-  /* Grid: stand body under mech — wider X, down-biased Y. */
-  for (int dy = -16; dy <= 96; dy += 16) {
-    for (int dx = -48; dx <= 48; dx += 16) {
+static void mw_stand_bg1_fill_grid(int ox, int oy, int mode, uint16_t scroll_x,
+                                   uint16_t loc_y, int dy0, int dy1) {
+  for (int dy = dy0; dy <= dy1; dy += 16) {
+    for (int dx = -64; dx <= 64; dx += 16) {
       if (s_stand_bg1.n_cells >= kMwStandBg1Max)
-        break;
+        return;
       const int wx = ox + dx;
       const int wy = oy + dy;
       uint16_t t7 = 0, tv = 0;
@@ -7173,28 +7267,29 @@ static void mw_stand_bg1_probe(int local_slot, uint16_t cam_x, uint16_t cam_y,
         t7 = mw_read7f16(off);
       if (g_ppu)
         tv = mw_bg1_vram_at_world((uint16_t)wx, (uint16_t)wy, scroll_x,
-                                  scroll_y);
+                                  loc_y);
       if (!mw_bg1_tile_weak(t7))
         s_stand_bg1.n_solid7f++;
       if (!mw_bg1_tile_weak(tv))
         s_stand_bg1.n_solidv++;
       uint16_t tv1 = tv;
-      if (mode == 3 && !mw_bg1_tile_weak(tv)) {
-        mw_bg1_blank_world_ex((uint16_t)wx, (uint16_t)wy, scroll_x, scroll_y,
-                              1);
-        tv1 = 0x0200u;
-        s_stand_bg1.n_touched++;
-      } else if (mode == 2) {
-        if (mw_bg1_tile_weak(tv)) {
-          /* Marker into sky — soak solid brown sample $1600. */
-          mw_bg1_write_world((uint16_t)wx, (uint16_t)wy, scroll_x, scroll_y,
-                             0x1600u);
-          tv1 = 0x1600u;
+      if (mode == 3) {
+        if (!mw_bg1_tile_weak(tv) || !mw_bg1_tile_weak(t7)) {
+          mw_bg1_blank_world_ex((uint16_t)wx, (uint16_t)wy, scroll_x, loc_y,
+                                1);
+          tv1 = 0x0200u;
           s_stand_bg1.n_touched++;
-        } else {
+        }
+      } else if (mode == 2) {
+        if (!mw_bg1_tile_weak(tv)) {
           tv1 = (uint16_t)(tv ^ 0x0018u);
-          mw_bg1_write_world((uint16_t)wx, (uint16_t)wy, scroll_x, scroll_y,
+          mw_bg1_write_world((uint16_t)wx, (uint16_t)wy, scroll_x, loc_y,
                              tv1);
+          s_stand_bg1.n_touched++;
+        } else if (!mw_bg1_tile_weak(t7)) {
+          /* VRAM sky, $7F has stand — stamp map ink into present VRAM. */
+          mw_bg1_write_world((uint16_t)wx, (uint16_t)wy, scroll_x, loc_y, t7);
+          tv1 = t7;
           s_stand_bg1.n_touched++;
         }
       }
@@ -7206,8 +7301,144 @@ static void mw_stand_bg1_probe(int local_slot, uint16_t cam_x, uint16_t cam_y,
       s_stand_bg1.tv1[i] = tv1;
     }
   }
+}
+
+static int mw_stand_bg1_try_scans(int mx, int my, uint16_t scroll_x,
+                                  uint16_t loc_y, const char *at, int *ox,
+                                  int *oy, const char **src_out) {
+  int sy0 = 80, sy1 = 130;
+  if (!strcmp(at, "pres")) {
+    sy0 = 40;
+    sy1 = 80;
+  } else if (!strcmp(at, "focus")) {
+    sy0 = 20;
+    sy1 = 60;
+  }
+  /* VRAM first, then $7F (stand often missing from present VRAM). */
+  if (mw_stand_bg1_scan_blob(mx, my, scroll_x, loc_y, sy0, sy1, 0, ox, oy)) {
+    *src_out = "scan";
+    return 1;
+  }
+  if (!strcmp(at, "auto") &&
+      mw_stand_bg1_scan_blob(mx, my, scroll_x, loc_y, 40, 80, 0, ox, oy)) {
+    *src_out = "scan";
+    return 1;
+  }
+  if (mw_stand_bg1_scan_blob(mx, my, scroll_x, loc_y, 20, 160, 0, ox, oy)) {
+    *src_out = "scan";
+    return 1;
+  }
+  if (mw_stand_bg1_scan_blob(mx, my, scroll_x, loc_y, sy0, sy1, 1, ox, oy)) {
+    *src_out = "scan7f";
+    return 1;
+  }
+  if (!strcmp(at, "auto") &&
+      mw_stand_bg1_scan_blob(mx, my, scroll_x, loc_y, 40, 80, 1, ox, oy)) {
+    *src_out = "scan7f";
+    return 1;
+  }
+  if (mw_stand_bg1_scan_blob(mx, my, scroll_x, loc_y, 20, 160, 1, ox, oy)) {
+    *src_out = "scan7f";
+    return 1;
+  }
+  return 0;
+}
+
+static void mw_stand_bg1_probe(int local_slot, uint16_t cam_x, uint16_t cam_y,
+                               uint16_t scroll_x, uint16_t scroll_y) {
+  memset(&s_stand_bg1, 0, sizeof(s_stand_bg1));
+  s_stand_bg1.slot = local_slot;
+  s_stand_bg1.ox = -1;
+  s_stand_bg1.oy = -1;
+  const int mode = mw_stand_bg1_mode();
+  if (!mw_coldump_armed() && mode < 2)
+    return;
+  if (mode == 2)
+    snprintf(s_stand_bg1.mode, sizeof(s_stand_bg1.mode), "mark");
+  else if (mode == 3)
+    snprintf(s_stand_bg1.mode, sizeof(s_stand_bg1.mode), "blank");
+  else
+    snprintf(s_stand_bg1.mode, sizeof(s_stand_bg1.mode), "dump");
+
+  (void)scroll_y;
+  const uint16_t loc_y = cam_y;
+
+  int mx = 0, my = 0;
+  const int have_mech = mw_find_dual_mech_xy(local_slot, &mx, &my);
+  s_stand_bg1.mx = have_mech ? mx : -1;
+  s_stand_bg1.my = have_mech ? my : -1;
+
+  const char *at = getenv("SNESRECOMP_MW_STAND_BG1_AT");
+  if (!at || !at[0])
+    at = "auto";
+  const char *ex = getenv("SNESRECOMP_MW_STAND_BG1_WX");
+  const char *ey = getenv("SNESRECOMP_MW_STAND_BG1_WY");
+
+  int ox = -1, oy = -1;
+  const char *src = "miss";
+
+  if (ex && ex[0] && ey && ey[0]) {
+    ox = atoi(ex);
+    oy = atoi(ey);
+    src = "env";
+  } else if (!strcmp(at, "mech")) {
+    if (have_mech) {
+      ox = mx;
+      oy = my;
+      src = "mech";
+    }
+  } else {
+    /* Per-slot latch first (survives other peer coldump + VRAM sky frames).
+     * Reject far-east shelf false latches (sx≫playfield). */
+    if ((local_slot == 0 || local_slot == 1)) {
+      if ((!strcmp(at, "mid") || !strcmp(at, "auto") || !strcmp(at, "focus")) &&
+          s_stand_latch_mid_have[local_slot]) {
+        const int lsx = s_stand_latch_mid_wx[local_slot] - (int)scroll_x;
+        if (lsx >= -64 && lsx < 320) {
+          ox = s_stand_latch_mid_wx[local_slot];
+          oy = s_stand_latch_mid_wy[local_slot];
+          src = "latch";
+        }
+      }
+      if (ox < 0 &&
+          (!strcmp(at, "pres") || !strcmp(at, "auto") || !strcmp(at, "mid")) &&
+          s_stand_latch_pres_have[local_slot]) {
+        const int lsx = s_stand_latch_pres_wx[local_slot] - (int)scroll_x;
+        if (lsx >= -64 && lsx < 320) {
+          ox = s_stand_latch_pres_wx[local_slot];
+          oy = s_stand_latch_pres_wy[local_slot];
+          src = "latch";
+        }
+      }
+    }
+    if (ox < 0 && have_mech) {
+      const char *scan_src = "scan";
+      if (mw_stand_bg1_try_scans(mx, my, scroll_x, loc_y, at, &ox, &oy,
+                                 &scan_src))
+        src = scan_src;
+    }
+  }
+
+  snprintf(s_stand_bg1.src, sizeof(s_stand_bg1.src), "%s", src);
+  s_stand_bg1.ox = ox;
+  s_stand_bg1.oy = oy;
+
+  static int logged;
+  if (!logged && mode >= 1) {
+    logged = 1;
+    fprintf(stderr,
+            "[mw_rtl] STAND_BG1=%s at=%s src=%s origin=(%d,%d) slot=%d — "
+            "present-only; unset when done\n",
+            s_stand_bg1.mode, at, src, ox, oy, local_slot);
+  }
+
+  if (ox < 0 || oy < 0) {
+    /* Keep mode+src=miss for coldump; no mech sky stamp. */
+    return;
+  }
+
+  mw_stand_bg1_fill_grid(ox, oy, mode, scroll_x, loc_y, -80, 64);
   (void)cam_x;
-  (void)cam_y;
 }
 
 /* Home brown latch: free $C6A4 + pinned $C382 (not on-mech backpack). */
@@ -7999,6 +8230,12 @@ static int mw_present_oam_from_objects(uint16_t cam_x, uint16_t cam_y_raw) {
   g_cpu = cpu_bak;
 
   if (ok) {
+    extern int snes_frame_counter;
+    /* Object-drawer path skips cam_capture — still latch present for coldump. */
+    s_coldump_present_slot = s_present_h2h_local_slot >= 0
+                                 ? s_present_h2h_local_slot
+                                 : 0;
+    s_coldump_present_frame = snes_frame_counter;
     static int logged;
     if (!logged) {
       logged = 1;
@@ -10640,8 +10877,14 @@ void MwDrawPpuFrameLocalFull(int local_slot) {
   if (!MwIsDualViewport())
     mw_prop_home_reset();
 
-  /* Refresh this slot's snap from live $7F when solid; keep prior if weak. */
-  mw_bg1_snap_capture(local_slot, cam_x, cam_y, 0);
+  /* Refresh this slot's snap from local 42B3 $7F (src_opt bypasses any
+   * residual gate). Keep prior if this window is all weak. */
+  {
+    uint16_t snap_src = mw_map_src_from_42b3(cam_x, cam_y);
+    if (!snap_src)
+      snap_src = mw_map_src_from_42b3(h0, v0);
+    mw_bg1_snap_capture(local_slot, cam_x, cam_y, snap_src);
+  }
   const int bg1_rebuild = mw_h2h_bg1_rebuild_armed();
   mw_present_rebuild_local_strips(cam_x, cam_y, h0, v0, h1, v1, bg1_rebuild,
                                   bg2_stream, cam_y_raw);
@@ -10786,6 +11029,14 @@ void MwDrawPpuFrameLocalFull(int local_slot) {
     ppu_runLine(g_ppu, i);
   }
 
+  /* Always tag which slot LocalFull presented — cam_capture only did this
+   * before; object-drawer OAM left present.slot=-1 in coldump. */
+  {
+    extern int snes_frame_counter;
+    s_coldump_present_slot = local_slot;
+    s_coldump_present_frame = snes_frame_counter;
+  }
+
   /* Dump before restore — mism_local must reflect presented VRAM, not sim. */
   mw_coldump_tick(local_slot);
 
@@ -10839,6 +11090,8 @@ void MwSessionReset(void) {
   memset(s_coldump_near_valid, 0, sizeof(s_coldump_near_valid));
   memset(s_coldump_bg_try, 0, sizeof(s_coldump_bg_try));
   memset(s_coldump_bg_hit, 0, sizeof(s_coldump_bg_hit));
+  memset(s_stand_latch_mid_have, 0, sizeof(s_stand_latch_mid_have));
+  memset(s_stand_latch_pres_have, 0, sizeof(s_stand_latch_pres_have));
   s_coldump_bg_slot = -1;
   s_coldump_last_f[0] = s_coldump_last_f[1] = -1;
   s_coldump_last_hash[0] = s_coldump_last_hash[1] = 0;

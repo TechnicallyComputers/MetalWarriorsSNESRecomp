@@ -508,8 +508,9 @@ note = "Common object pool base; stride 0x1C through ~$2000. Pool slots recycle 
 #   $C38C (m=50060) bank $B1 item @ dy≈−14 on $1A68 — backpack-class when
 #      present. Not the stand.
 #   Mech $E442/$AD — body CHR.
-#   STAND MAP/BG1 probe (current): SNESRECOMP_MW_STAND_BG1=dump|mark|blank
-#      + coldump stand_bg1. Present-only; no FP/gap-fill/CHR allowlist.
+#   STAND MAP/BG1 (current): two $1600 VRAM bands — plat.pres WORLD (top snap)
+#      vs paint.mid SCREEN_FIXED (bottom). Probe: STAND_BG1=dump|mark|blank
+#      + STAND_BG1_AT=auto|mid|pres|focus|mech. Coldump stand_bg1.src.
 #   Absent: $62/$C8 hzd, $D5B8 elev, $C6A4 meta in props.
 #
 # $C6A4 (m=50852) — TWO roles (same meta; distinguish by geometry):
