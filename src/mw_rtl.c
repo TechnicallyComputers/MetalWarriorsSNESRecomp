@@ -533,6 +533,16 @@ static uint16_t s_ostripe_locx[kMwOrphanStripeMax];
 static int16_t s_ostripe_sx[kMwOrphanStripeMax];
 static uint8_t s_ostripe_valid[kMwOrphanStripeMax];
 
+/* Untagged gameplay $E4 on-mech backpack: capture wx freezes while the mech
+ * walks (poam s:0 lag). Latch mech-relative offset when tight; hold through
+ * stale capture. Free $C6A4 platform $E4 stays far from mech — untouched. */
+enum { kMwE4PackMax = 4 };
+static int16_t s_e4pack_ox[kMwE4PackMax];
+static int16_t s_e4pack_oy[kMwE4PackMax];
+static uint16_t s_e4pack_mechx[kMwE4PackMax];
+static int8_t s_e4pack_cam[kMwE4PackMax];
+static uint8_t s_e4pack_valid[kMwE4PackMax];
+
 static void mw_prop_home_reset(void) {
   memset(s_prop_home_obj, 0, sizeof(s_prop_home_obj));
   memset(s_prop_home_cam, -1, sizeof(s_prop_home_cam));
@@ -558,6 +568,7 @@ static void mw_prop_home_reset(void) {
   memset(s_prop_use_glued, 0, sizeof(s_prop_use_glued));
   memset(s_ostripe_valid, 0, sizeof(s_ostripe_valid));
   memset(s_ostripe_tile, 0, sizeof(s_ostripe_tile));
+  memset(s_e4pack_valid, 0, sizeof(s_e4pack_valid));
 }
 
 static int mw_prop_slot_for_obj(uint16_t obj) {
@@ -925,6 +936,95 @@ static int mw_find_dual_mech_xy(int slot, int *ox, int *oy) {
     idx = next;
   }
   return 0;
+}
+
+/*
+ * Gameplay-path $E4 backpack (not prop sticky). Capture wx freezes while the
+ * mech walks → poam s:0 falls behind. Latch mech-relative offset when tight
+ * (≤16×28); hold while capture stays near the expected seat. Far $E4 (free
+ * platform / unrelated) keeps capture world XY — never CHR-allowlist lock.
+ */
+static void mw_orphan_e4_backpack_xy(int cap_wx, int cap_wy, int local_slot,
+                                     int *out_x, int *out_y) {
+  int mx = 0, my = 0;
+  if (!mw_find_dual_mech_xy(local_slot, &mx, &my)) {
+    if (out_x)
+      *out_x = cap_wx;
+    if (out_y)
+      *out_y = cap_wy;
+    return;
+  }
+  const int dx = cap_wx - mx;
+  const int dy = cap_wy - my;
+  const int adx = dx < 0 ? -dx : dx;
+  const int ady = dy < 0 ? -dy : dy;
+
+  int slot = -1;
+  for (int i = 0; i < kMwE4PackMax; i++) {
+    if (!s_e4pack_valid[i] || (int)s_e4pack_cam[i] != local_slot)
+      continue;
+    const int expect_wx = mx + (int)s_e4pack_ox[i];
+    const int expect_wy = my + (int)s_e4pack_oy[i];
+    const int aedx = cap_wx > expect_wx ? cap_wx - expect_wx : expect_wx - cap_wx;
+    const int aedy = cap_wy > expect_wy ? cap_wy - expect_wy : expect_wy - cap_wy;
+    const int odx = dx - (int)s_e4pack_ox[i];
+    const int ody = dy - (int)s_e4pack_oy[i];
+    if (adx <= 48 && ady <= 40 && odx <= 8 && odx >= -8 && ody <= 8 &&
+        ody >= -8) {
+      slot = i;
+      break;
+    }
+    if (aedx <= 48 && aedy <= 40) {
+      slot = i;
+      break;
+    }
+  }
+
+  if (adx <= 16 && ady <= 28) {
+    if (slot < 0) {
+      for (int i = 0; i < kMwE4PackMax; i++) {
+        if (!s_e4pack_valid[i]) {
+          slot = i;
+          break;
+        }
+      }
+      if (slot < 0)
+        slot = 0;
+    }
+    s_e4pack_ox[slot] = (int16_t)dx;
+    s_e4pack_oy[slot] = (int16_t)dy;
+    s_e4pack_mechx[slot] = (uint16_t)mx;
+    s_e4pack_cam[slot] = (int8_t)local_slot;
+    s_e4pack_valid[slot] = 1;
+    if (out_x)
+      *out_x = mx + dx;
+    if (out_y)
+      *out_y = my + dy;
+    return;
+  }
+
+  if (slot >= 0) {
+    const int dmx = mx - (int)s_e4pack_mechx[slot];
+    if (dmx > 80 || dmx < -80) {
+      s_e4pack_valid[slot] = 0;
+      if (out_x)
+        *out_x = cap_wx;
+      if (out_y)
+        *out_y = cap_wy;
+      return;
+    }
+    s_e4pack_mechx[slot] = (uint16_t)mx;
+    if (out_x)
+      *out_x = mx + (int)s_e4pack_ox[slot];
+    if (out_y)
+      *out_y = my + (int)s_e4pack_oy[slot];
+    return;
+  }
+
+  if (out_x)
+    *out_x = cap_wx;
+  if (out_y)
+    *out_y = cap_wy;
 }
 
 /* Store / update soft home hint. firm=1 once both mechs have been seen. */
@@ -1876,14 +1976,9 @@ static uint16_t mw_bg1_vram_at_world(uint16_t world_x, uint16_t world_y,
 
 /* Snapshot one cam's BG1 strip out of $7F (survives dual VRAM stomps).
  * Columns are relative to src: [-kMwBg1SnapWest, +span).
- *
- * Dual: src_opt from DMA note is always trusted. Derived 42B3 captures
- * always attempt a read of *this cam's* window — a prior ownership gate
- * (require live $1E36 near local src) starved P2 snap whenever peer DMA
- * was active (netplay: src1≢src_loc → underfeet strip stayed sky). All-
- * weak captures still keep the prior solid snap. When live DMA is foreign,
- * merge prior solid into newly weak native cells (same column only) so a
- * half-stomped $7F window does not erase a good snap. */
+ * All-weak captures keep the prior solid snap. West-only history merge —
+ * native-col merge froze terrain / shattered floors (2026-08-04) and the
+ * 2026-08-05 foreign-live native merge misbehaved other BG while panning. */
 static void mw_bg1_snap_capture(int slot, uint16_t cam_x, uint16_t cam_y,
                                 uint16_t src_opt) {
   uint16_t words[kMwBg1SnapRows][kMwBg1SnapCols];
@@ -1896,10 +1991,6 @@ static void mw_bg1_snap_capture(int slot, uint16_t cam_x, uint16_t cam_y,
     src = mw_map_src_from_42b3(cam_x, cam_y);
   if (!src)
     return;
-  const uint16_t live =
-      s_nmi_latched ? s_nmi_src_bg1 : mw_wram16(0x1E36u);
-  const int live_owned =
-      live && mw_bg1_src_near_column(src, live, pitch, 2);
   const int col_lo = -kMwBg1SnapWest;
   const int col_hi = kMwBg1SnapCols - kMwBg1SnapWest;
   memset(words, 0, sizeof(words));
@@ -1923,16 +2014,11 @@ static void mw_bg1_snap_capture(int slot, uint16_t cam_x, uint16_t cam_y,
   /* Dual often stomps only the 17-col stripe; west of src goes void while
    * the strip stays solid. Merging keeps prior west history for the left
    * widescreen gutter (DMA pad_left is always 0).
-   * When live DMA is foreign, also keep prior solid native cells that this
-   * capture read as weak — otherwise P2's snap collapses to sky and present
-   * void→sky punches underfeet holes. Do not merge when live-owned (that
-   * froze terrain / re-shattered floors with tall pin FP — 2026-08-04). */
+   * Do NOT merge native-strip cells — that froze stale terrain. */
   if (snap->valid && snap->src &&
       mw_bg1_src_same_column(src, snap->src, pitch)) {
-    const int merge_hi =
-        live_owned ? kMwBg1SnapWest : kMwBg1SnapCols;
     for (int row = 0; row < kMwBg1SnapRows; row++) {
-      for (int c = 0; c < merge_hi; c++) {
+      for (int c = 0; c < kMwBg1SnapWest; c++) {
         if (mw_bg1_tile_weak(words[row][c]) &&
             !mw_bg1_tile_weak(snap->words[row][c]))
           words[row][c] = snap->words[row][c];
@@ -5398,8 +5484,10 @@ static void mw_coldump_tick(int local_slot) {
         if (adx < 0)
           adx = -adx;
         const int sx = best_cx - (int)loc_x;
-        const int near_ok = adx <= 160 || (sx >= 0 && sx < 320 && adx <= 220);
-        if (near_ok || best_score >= 40) {
+        /* Reject far-east shelf (sx≥256) — dump false latch odx≈200 sx=289. */
+        const int near_ok =
+            adx <= 160 || (sx >= 0 && sx < 256 && adx <= 180);
+        if (near_ok || (best_score >= 40 && sx < 256)) {
           pres_ok = 1;
           pres_n = best_n;
           pres_wx = best_cx;
@@ -6917,23 +7005,15 @@ static void mw_present_rebuild_layer_strip(int layer, uint16_t cam_x,
   const int view_rel_x = (layer == 0 && s_present_h2h_full_frame);
 
   /* Prefer live $7F; snap fills dual-stomped voids/sky (±1 tile column).
-   * Full-frame: also prefer snap when live DMA $1E36 is foreign — peer
-   * solid in $7F is view-column–sticky (stand mid band SCREEN_FIXED).
-   * Weak ($0200) live must yield to solid snap too — void-only fill left
-   * underfeet sky when dual wrote sky into the stripe (netplay P2). */
+   * Do NOT prefer_snap / world-abs-replace solid live when DMA is foreign —
+   * that hitch other BG while panning and left the stand FOV-stuck
+   * (2026-08-05). Void-only world-abs below is the only 42B3 rescue. */
   const int use_snap =
       (layer == 0 && (local_slot == 0 || local_slot == 1) &&
        s_bg1_snap[local_slot].valid &&
        mw_bg1_src_near_column(src, s_bg1_snap[local_slot].src, pitch, 1) &&
        ((int)s_bg1_snap[local_slot].cam_x - (int)scroll_x <= 24 &&
         (int)s_bg1_snap[local_slot].cam_x - (int)scroll_x >= -24));
-  const uint16_t live_dma =
-      (layer == 0)
-          ? (s_nmi_latched ? s_nmi_src_bg1 : mw_wram16(0x1E36u))
-          : 0;
-  const int prefer_snap =
-      (layer == 0 && s_present_h2h_full_frame && use_snap && live_dma && src &&
-       !mw_bg1_src_near_column(src, live_dma, pitch, 1));
   const int tile_px = 1 << (int)sh;
 
   /* Foreign-ink filter: latched present cams only (never re-read WRAM). */
@@ -6984,15 +7064,13 @@ static void mw_present_rebuild_layer_strip(int layer, uint16_t cam_x,
       if (use_snap) {
         const uint16_t ts =
             mw_bg1_snap_word(local_slot, src, pitch, row, col);
-        /* Solid snap wins over void/sky live; prefer_snap also replaces
-         * peer-sticky solid live when DMA is foreign. */
-        if (!mw_bg1_tile_weak(ts) &&
-            (mw_bg1_tile_weak(t) || prefer_snap))
+        /* Solid snap only fills void/sky live — never replace solid. */
+        if (!mw_bg1_tile_weak(ts) && mw_bg1_tile_weak(t))
           t = ts;
       }
-      /* Stripe-relative $7F can miss a cell that world 42B3 still holds
-       * (non-linear row bases / dual stomp). Try world-abs before sky. */
-      if (layer == 0 && s_present_h2h_full_frame && mw_bg1_tile_weak(t) &&
+      /* Void-only world-abs: stripe miss that 42B3 still holds. Do not
+       * replace solid or sky live (foreign-DMA world-abs hitch). */
+      if (layer == 0 && s_present_h2h_full_frame && mw_bg1_tile_void(t) &&
           col >= 0) {
         const int wx = (int)scroll_x + col * tile_px + tile_px / 2;
         const int wy = (int)scroll_y + row * tile_px + tile_px / 2;
@@ -7441,7 +7519,9 @@ static void mw_stand_bg1_probe(int local_slot, uint16_t cam_x, uint16_t cam_y,
   (void)cam_x;
 }
 
-/* Home brown latch: free $C6A4 + pinned $C382 (not on-mech backpack). */
+/* Home brown latch: free $C6A4 + pinned $C382 (not on-mech backpack).
+ * All-stage-prop $C382 home-brown was a false lead (2026-08-05): elev-room
+ * stand is plat.pres map/$7F; catalog $C382 pins sit far-Y (sy≪0). */
 static int mw_home_brown_eligible(uint16_t obj) {
   const uint16_t meta = mw_wram16((uint16_t)(obj + 8u));
   if (mw_prop_is_pinned_hazard(obj))
@@ -9248,6 +9328,9 @@ static int mw_present_oam_from_cam_capture(int local_slot, int extra,
     if (mw_plat_stripe_tile_ok(sp[2]))
       mw_orphan_stripe_world_xy(sp[2], use_wx, use_wy, loc_x, &use_wx,
                                 &use_wy);
+    /* Untagged $E4 on-mech backpack: capture wx freezes → falls behind. */
+    else if (sp[2] == 0xE4u)
+      mw_orphan_e4_backpack_xy(use_wx, use_wy, local_slot, &use_wx, &use_wy);
     const int x = use_wx - (int)loc_x;
     if (x + 64 < x_lo || x > x_hi)
       continue;
@@ -9547,6 +9630,9 @@ static int mw_present_oam_from_cam_capture(int local_slot, int extra,
     if (mw_plat_stripe_tile_ok(sp[2]))
       mw_orphan_stripe_world_xy(sp[2], world_x, world_y, loc_x, &world_x,
                                 &world_y);
+    else if (sp[2] == 0xE4u)
+      mw_orphan_e4_backpack_xy(world_x, world_y, local_slot, &world_x,
+                               &world_y);
     const int x = world_x - (int)loc_x;
     const int sy = world_y - (int)loc_y;
     /* Screen-fixed dual half: same raw XY in both cams — skip. Do NOT

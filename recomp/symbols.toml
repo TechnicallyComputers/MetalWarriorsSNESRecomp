@@ -500,57 +500,42 @@ note = "Common object pool base; stride 0x1C through ~$2000. Pool slots recycle 
 #      crate (220,621); hazard stripe+brown. Host: mw_prop_is_pinned_hazard.
 #   Soak suspects + manip queue: docs/H2H_STAGE_PROPS.md §8a / §8b.
 #
-# Giant hazard stand (FOV grid-snap) — soak suspects 2026-08-05:
-#   BEST: map collision + BG1 (feet often sky). NOT catalog pins.
-#   $C382 @ (637|832,365)/(220,106) — RULED OUT (manip); PROP_PIN_DY unset
-#      (regressed walls/items). Do not reuse pin FP as stand probe.
-#   (350,490) — meta recycles $C39E/$C3EC; list-prop probe skipped (not stand).
-#   $C38C (m=50060) bank $B1 item @ dy≈−14 on $1A68 — backpack-class when
-#      present. Not the stand.
-#   Mech $E442/$AD — body CHR.
-#   STAND MAP/BG1 (current): two $1600 VRAM bands — plat.pres WORLD (top snap)
-#      vs paint.mid SCREEN_FIXED (bottom). Probe: STAND_BG1=dump|mark|blank
-#      + STAND_BG1_AT=auto|mid|pres|focus|mech. Coldump stand_bg1.src.
-#   Absent: $62/$C8 hzd, $D5B8 elev, $C6A4 meta in props.
+# Giant hazard stand (FOV grid-snap) — coldump verdict 2026-08-05:
+#   PAINT: map/$7F ledge tiles — paint.band t=$1600 (5632) near mech, and/or
+#   paint.mid/vis t=$1200 (4608) east ledge. Not list props ($C382 far-Y).
+#   P2 soak: feet strip all sky; src_loc ≢ dma.aadr (foreign DMA always);
+#   plat.pres often false-latches east shelf (sx≥256 odx≈200) — reject.
+#   Host rebuild: live $7F + snap fills weak only + void-only world-abs.
+#   View-rel X + h0_ppu=cam&15 kept. Stand FOV still OPEN.
+#   FALSE LEADS (reverted): PROP_PIN_DY, all-$C382 home-brown, underfeet
+#   weak→snap / native snap merge, foreign-DMA solid world-abs / prefer_snap
+#   (other BG hitch; stand unchanged).
+#   Trust present.slot==slot (ps:-1 dual lines inherit peer pscroll).
 #
 # $C6A4 (m=50852) — TWO roles (same meta; distinguish by geometry):
-#   1) ON-MECH PICKUP / backpack (common under P2 in chase dumps):
-#      near[] dx≈±4, dy≈−14; sticky $E4×2 (mox 0/−15, moy −10); origin
-#      t7f=$0200 (sky — no brown body). Present MUST follow live so OAM
-#      stays on the mech back. World-locking this tore the pickup off
-#      (use stuck far, oam off-screen, present.n→0). Pool $1A68 may
-#      show sibling meta $C38C (50060) with the same backpack geometry.
+#   1) ON-MECH PICKUP / backpack: often ABSENT from props[] while visible.
+#      Coldump: poam t=$E4 (228) s:0 near mech — gameplay capture path, not
+#      prop sticky (s:1). Capture wx freezes → $E4 falls behind as mech walks
+#      (msx +22 while e4.x +9). Host: mw_orphan_e4_backpack_xy latches
+#      mech-relative offset when tight; free far $E4 untouched.
+#      When in props as $C6A4 near mech: present_world_xy follow-live.
+#      Sibling $C38C (50060) same backpack geometry when present.
 #   2) Free-floating mover (not within ±48x/±32y of either mech): keep
-#      world-lock X+Y through cam_corr / remote; sticky $E4 only; brown
-#      latch only when not on-mech.
-# Giant hazard stand is NOT $C6A4 / $C38C backpack — BG1/map (plat.pres).
-# Feet / plat.coll = collision gate only; present origin varies (odx/ody).
-# plat.pres scores contiguous $7F/VRAM runs near coll + on-screen (not
-# widest far shelf — dump false latch west=896 odx=167 sx=342).
-# plat.stripe = $62/$C8 hazard OAM only (never $E4 backpack).
-# Lag: pres_world (d_pres_wx≈0) vs pres_lock (d_pres_wx≈dloc) while |dloc|≥2.
+#      world-lock X+Y; sticky $E4 s:1; brown latch only when not on-mech.
+# Giant hazard stand is NOT $C6A4 / $C38C / $C382 list — map/$7F plat.pres.
+# Feet / plat.coll = collision gate only. plat.stripe = $62/$C8 only (never $E4).
 #
-# GRID-SNAP STAND — collision ≠ paint (2026-08-05):
-#   Do NOT locate paint under mech feet. Feet sky / plat.under empty at coll
-#   only proves the split. Coldump paint{}: FOV BG1 cands + focus.lag
-#   (lock=FOV-follow, world=world-lock) and paint.oam[] — no feet gate.
-#   Identify which cand/oam is the circled hitching layer, then marry to coll.
-#   mw_bg1_vram_at_world: world tile row; view-rel X full-frame.
-#
-# FALSE LEAD (2026-08-05) — DO NOT revive CHR allowlist world-lock:
-#   Untagged poam t=$0A/$0C/$0E/$20/$22/$28/$40… under P2 feet with s:0 looked
-#   like "stand platform" when present.n=0 / no list prop. Those tiles are
-#   MECH body CHR (bank $00AD / meta $E442) — same cluster as $06/$08/$E4/$E6.
-#   Capture world-lock by tile id froze half the mech (sliced presentation).
-#   Identify platform present by object (whitelist meta / local_only / sticky
-#   $E4) or BG1/$7F map-brown — never raw tile-id allowlists on untagged OAM.
+# FALSE LEAD (2026-08-05) — DO NOT revive:
+#   - CHR allowlist world-lock on untagged OAM (froze mech body).
+#   - All stage-prop $C382 home-brown / wide brown capture (stand unchanged;
+#     backpack side risk). Home brown stays: pins + free $C6A4 only.
+#   - Underfeet weak→snap / world-abs $7F / native snap merge.
+#   - Foreign-DMA solid world-abs / prefer_snap (other map edges tear).
 #
 # Host-present paint (display-only — NOT sim collision):
 #   mw_rider_brown_paint → mw_bg1_paint_world writes BG1 VRAM only.
-#   Eligible: free (not on-mech) $C6A4 + pinned $C382. On-mech backpack
-#   clears brown latch. Pins paint catalog +$02/+$04 only. Scrub prior paint
-#   on XY move; clear on foreign home / sticky death. plat.stripe: $62/$C8 only.
-#   Mid-ledge neither-FOV → closer |sy|. Pin paint skip far_y.
+#   Eligible: pinned $C382 + free (not on-mech) $C6A4. Pins paint catalog
+#   +$02/+$04 only; pin far_y skip. Scrub prior paint on XY move.
 #   Gameplay OAM skips tiles latched in prop sticky (sticky path only).
 
 [[object]]
@@ -690,7 +675,8 @@ note = "24-bit NMI body pointer; normally $80:818A"
 #   $E442=58434, $D5B8=54712. Soak suspects: docs/H2H_STAGE_PROPS.md §8a.
 # ---------------------------------------------------------------------------
 # Bank $00B1 — movers / items / elevators (stage-prop whitelist is meta-gated)
-#   $C382 — hazard stripe + brown body (most common pin)
+#   $C382 — hazard stripe + brown body; catalog pins only for home-brown.
+#           Elev-room giant stand paint is map/$7F (plat.pres), not this meta.
 #   $C39E — ledge/handoff prop (1118,490 forever-lock catalog)
 #   $C6A4 — on-mech backpack pickup (dx≈±4,dy≈−14, $E4×2) OR free mover;
 #           brown latch only when free (not near mech). NOT the giant stand.

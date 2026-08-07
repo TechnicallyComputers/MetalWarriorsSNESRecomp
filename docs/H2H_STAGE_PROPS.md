@@ -440,19 +440,21 @@ soak “wins” into `symbols.toml` until a lever moves the circled stand.
 
 | Suspect | Soak evidence | Role vs stand |
 | ------- | ------------- | ------------- |
-| **Map collision (no list obj)** | `near` at feet = mechs + one backpack-shaped item; no elev/prop under stand | **Collision surface** |
-| **BG1 map tiles (when ink exists)** | `feet.weak=1`; `strip.feet` mostly `$0200` sky; sparse solid `5632`/`4608`/`5696`/`5122` west/far | **Paint surface** (often empty under feet) |
+| **Map/`$7F` ledge (`paint.band` `$1600`, mid `$1200`)** | P2: feet strip sky; `src_loc≢dma`; band SCREEN_FIXED | **Paint** — still open (not list props) |
+| **Map collision (no list obj under feet)** | `near` = mechs only; feet `t7f=512` | **Collision** (separate) |
+| **`plat.pres` east shelf** | `sx≥256` `odx≈200` | **False latch** — reject in coldump |
 
 ### List / OAM objects seen while on stand
 
 | Suspect | Coldump id | Evidence | Working verdict |
 | ------- | ---------- | -------- | --------------- |
-| **`$C382` mid-ledge** | `m=50050` @ `(637\|832,365)` | In `props[]` every frame; far from feet | **Ruled out** (manip §8b step1) |
-| **`$C382` upstairs** | `m=50050` @ `(220,106)` | In `props[]`; far-Y from stand | **Ruled out** (same pin path) |
-| **`$C39E` / `$C3EC` @ `(350,490)`** | meta recycles (`50078` vs `50156`) | Far from feet; C39E probe never hit (`use==sx`) | **Skip list props** — not stand |
-| **`$C38C` item** | `m=50060`, bank `$B1`, `o≈$1A68` | Sometimes `dy≈-14` + `$E4`; later soaks mechs-only `near` | Backpack when present — not stand |
-| **Mech body** | `$E442` / `$E1C4` / … bank `$AD` | Dominate `near` | Mech — never CHR-allowlist |
-| **OAM CHR `$0A/$0C/$0E/$20…` + `$E4`** | `paint.oam` | Dense under P2 | Mech body + backpack sticky |
+| **`$C382` catalog pins** | `(637\|832,365)` / `(220,106)` `sy≪0` | `glue=0` `dwx=0`; far above cam | **Ruled out** — not under-feet stand |
+| **All-`$C382` home-brown** | class latch experiment | Stand unchanged; backpack side risk | **Reverted** |
+| **`$C39E` / `$C3EC` @ `(350,490)`** | meta recycles | Far from feet | Not stand |
+| **Backpack `$E4` `poam s:0`** | t=228 near mech, often no props meta | Capture wx freezes → lags mech | **Fixed** — `mw_orphan_e4_backpack_xy` |
+| **`$C6A4` / `$C38C` in props** | often `pack:[]` while `$E4` visible | Follow-live when listed near mech | Not stand |
+| **Mech body** | `$E442` / bank `$AD` | Dominate `near` / `poam` | Mech — never CHR-allowlist |
+| **Underfeet / foreign-DMA strip rewrite** | weak→snap, native merge, world-abs solid | Other BG hitch; stand unchanged | **Ruled out / reverted** |
 
 ### Absent this soak (still catalogued)
 
@@ -645,25 +647,21 @@ not widen; no fingerprint paint.
 15. Both-peer BG1 flicker with `present.n=0`: P1 `bg_hit` on pinned `$C382`
     should rise well above ~10; P2 home pin brown stable at top edge (`sy≈-14`).
 16. Mid-view stand “follows cam in grid snaps opposite pan”:
-    **Collision ≠ paint.** Hitching layer = present BG1 VRAM (not OAM).
-    Soak: same tile `$1600` — top `plat.pres` WORLD, bottom `paint.mid`
-    SCREEN_FIXED (horizontal seam). Cause: dual `$7F` peer strip poisoned
-    per-slot snap (blind NMI/present capture) while full-frame rebuild
-    refused snap-fill, so some rows stayed on view-sticky live ink.
-    Fix (2026-08-05): full-frame prefer snap when live `$1E36` is foreign;
-    void→snap then sky. Keep view-rel X + `h0_ppu=cam&15`.
-17. **Netplay P2 underfeet sky / grid snap (2026-08-05):** LocalFull on
-    slot 1 with `src_loc` ≠ `src1` (peer DMA). An ownership gate on
-    derived 42B3 snap capture refused refresh whenever live was foreign →
-    P2 snap starved; rebuild wrote `$0200` under the mech
-    (`feet.t7f=tvram=512`, `strip.lag.solid=0`) while far false
-    `plat.pres` (`odx≈200`) still WORLD-locked. Coldump: trust
-    `present.slot==slot` (dual-slot lines with `ps:-1` inherit the other
-    peer’s `pscroll`). Fix: always attempt local-42B3 snap; when live
-    foreign, merge prior solid into newly weak native snap cells; rebuild
-    yields solid snap over weak/sky live (not void-only); world-abs `$7F`
-    fallback before sky. Verify on P2: `present.slot==1`,
-    `feet.weak→0` / `strip.lag.solid>0` while on the circled stand.
+    **Paint = map/`$7F` ledge** (`paint.band` `$1600`, mid/vis `$1200`), not
+    list `$C382`. P2: feet strip sky; live DMA foreign (`src_loc≢dma.aadr`).
+    Keep view-rel X + `h0_ppu=cam&15`; reject `plat.pres` sx≥256 east shelf.
+    **Still open** — next dig: per-cell coldump `stripe_t` vs `world_t` vs
+    `vram_t` + lag class while panning (not another strip-wide rewrite).
+17. **FALSE LEAD — strip rewrites that hitch other BG (2026-08-05, reverted):**
+    Underfeet ownership/native snap merge, weak→snap on live sky, foreign-DMA
+    **solid** world-abs / `prefer_snap` — other map edges tear while stand
+    FOV-stuck unchanged. Rebuild keeps: live `$7F`, snap fills weak only,
+    **void-only** world-abs. Trust `present.slot==slot` (dual `ps:-1` inherits
+    peer `pscroll`). Do not revive strip-wide solid replace.
+18. **Backpack lag (untagged `$E4` `poam s:0`, 2026-08-05):** Often absent from
+    `props[]` as `$C6A4`/`$C38C`. Gameplay capture wx freezes while mech walks.
+    Fix: `mw_orphan_e4_backpack_xy` — latch mech-relative offset when tight;
+    free far `$E4` (platform sticky) unchanged. Verify: `e4.x` tracks `msx`.
 
 Named guest symbols (`recomp/symbols.toml`): `MwObject`, `ObjectListHead`,
 `ObjectPoolBase`, `Cam0_X`/`Cam1_X`, `Bg1MapPitch` (`$00B6`), `StripSrc_A/B`,
@@ -676,8 +674,11 @@ Named guest symbols (`recomp/symbols.toml`): `MwObject`, `ObjectListHead`,
 
 | Date       | Note                                                                                                                                                                                                                                                                          |
 | ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| 2026-08-05 | Netplay P2 underfeet sky: drop starve-gate on 42B3 snap; foreign-live native snap merge; weak→snap + world-abs `$7F` before sky.                                                                     |
-| 2026-08-05 | Stand hitch: prefer snap when live DMA foreign (unify `$1600` SCREEN_FIXED mid → WORLD). Ownership gate later starved P2 — see #17.                                                                   |
+| 2026-08-05 | Revert foreign-DMA solid world-abs / `prefer_snap` (other BG hitch; stand unchanged). Keep void-only 42B3; backpack `$E4`; reject `plat.pres` east shelf.                                          |
+| 2026-08-05 | Stand = map/`$7F` (not `$C382`); revert all-`$C382` home-brown; backpack `$E4` s:0 → `mw_orphan_e4_backpack_xy`.                                                                                        |
+| 2026-08-05 | (reverted) all-`$C382` home-brown / wide capture — pins far-Y; stand unchanged.                                                                                                                      |
+| 2026-08-05 | (reverted) underfeet sky strip merge — other BG hitch; stand unchanged. See #17.                                                                                                                    |
+| 2026-08-05 | Stand hitch: prefer snap when live DMA foreign (void holes). Not the stand class fix.                                                                                                                 |
 | 2026-08-05 | STAND_BG1: `src=miss` emit; `$7F` scan + stamp; latch sx gate; LocalFull always sets `present.slot`.                                                                                                |
 | 2026-08-05 | STAND_BG1: live `$1600` scan with raw cam Y; per-slot mid/pres latch; no mech sky-stamp on mark/blank.                                                                                              |
 | 2026-08-05 | Stand split: `$1600` WORLD `pres` (top) vs SCREEN_FIXED `mid` (bottom). `STAND_BG1_AT=mid\|pres`; fix coldump bg2/`stand_bg1` JSON.                                                                    |
